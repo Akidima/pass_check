@@ -40,12 +40,24 @@ def get_subject_cutout(pil_img):
     """
     pil_img_rgb = pil_img.convert("RGB")
 
+    cutout_img = None
     if REMBG_AVAILABLE and REMBG_SESSION is not None:
         try:
-            return rembg_remove(pil_img_rgb, session=REMBG_SESSION)
+            cutout_img = rembg_remove(pil_img_rgb, session=REMBG_SESSION)
         except Exception as e:
             print(f"rembg_remove error: {e}")
             pass
+
+    if cutout_img is not None:
+        arr_rgba = np.array(cutout_img)
+        if arr_rgba.ndim == 3 and arr_rgba.shape[2] == 4:
+            alpha = arr_rgba[:, :, 3].copy()
+            # Clean up low-alpha background noise and fringe artifacts
+            alpha[alpha < 18] = 0
+            valid_mask = alpha >= 18
+            alpha[valid_mask] = np.clip((alpha[valid_mask].astype(np.float32) - 18.0) * (255.0 / 237.0), 0, 255).astype(np.uint8)
+            arr_rgba[:, :, 3] = alpha
+            return Image.fromarray(arr_rgba, mode="RGBA")
 
     arr = np.array(pil_img_rgb)
     h, w = arr.shape[:2]
@@ -115,15 +127,6 @@ def get_subject_cutout(pil_img):
             grabcut_bg_mask = flood_bg_mask
 
         final_bg_mask = np.minimum(grabcut_bg_mask, flood_bg_mask)
-
-        if faces:
-            f = faces[0]
-            fx, fy, fw, fh = f["x"], f["y"], f["w"], f["h"]
-            body_top = min(h - 1, fy + int(fh * 0.75))
-            final_bg_mask[body_top:h, :] = 0.0
-        else:
-            body_top = int(h * 0.35)
-            final_bg_mask[body_top:h, :] = 0.0
 
         fg_alpha = ((1.0 - final_bg_mask) * 255).astype(np.uint8)
         arr_rgba = np.dstack((arr, fg_alpha))
