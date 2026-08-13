@@ -179,21 +179,16 @@ def process_photo_edits(image_bytes, brightness=0.0, width=None, height=None, sh
         pass
     pil_img = pil_img.convert("RGB")
 
-    # 1. Background Color Replacement
-    if bg_color:
-        pil_img = replace_background_color(pil_img, bg_color)
+    # 1. Sharpness adjustment on original subject before background replacement
+    try:
+        s_val = float(sharpness)
+        if s_val != 1.0 and s_val >= 0:
+            enhancer = ImageEnhance.Sharpness(pil_img)
+            pil_img = enhancer.enhance(s_val)
+    except (ValueError, TypeError):
+        pass
 
-    # 2. Resolution / Resizing
-    if width and height:
-        try:
-            w = int(width)
-            h = int(height)
-            if w > 0 and h > 0:
-                pil_img = pil_img.resize((w, h), Image.Resampling.LANCZOS)
-        except (ValueError, TypeError):
-            pass
-
-    # 3. Brightness adjustment
+    # 2. Brightness adjustment
     try:
         b_val = float(brightness)
         if b_val != 0.0:
@@ -206,14 +201,19 @@ def process_photo_edits(image_bytes, brightness=0.0, width=None, height=None, sh
     except (ValueError, TypeError):
         pass
 
-    # 4. Sharpness adjustment
-    try:
-        s_val = float(sharpness)
-        if s_val != 1.0 and s_val >= 0:
-            enhancer = ImageEnhance.Sharpness(pil_img)
-            pil_img = enhancer.enhance(s_val)
-    except (ValueError, TypeError):
-        pass
+    # 3. Background Color Replacement (pure solid canvas composite)
+    if bg_color:
+        pil_img = replace_background_color(pil_img, bg_color)
+
+    # 4. Resolution / Resizing
+    if width and height:
+        try:
+            w = int(width)
+            h = int(height)
+            if w > 0 and h > 0:
+                pil_img = pil_img.resize((w, h), Image.Resampling.LANCZOS)
+        except (ValueError, TypeError):
+            pass
 
     out_buf = io.BytesIO()
     pil_img.save(out_buf, format="JPEG", quality=95)

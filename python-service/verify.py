@@ -570,9 +570,32 @@ def check_passport_size_ratio(bgr, faces, params):
 
 
 def check_blur(bgr, faces, params):
+    """
+    Passport-standard sharpness detection.
+    Evaluates focus/sharpness on the face & subject region (where detail matters),
+    preventing solid/uniform background regions from diluting the sharpness score.
+    """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-    threshold = params.get("blur_threshold", 80.0)
+    
+    # Focus evaluation on face/head ROI if detected (ICAO passport guideline)
+    if faces:
+        f = faces[0]
+        h, w = gray.shape[:2]
+        pad_x = int(f["w"] * 0.25)
+        pad_y = int(f["h"] * 0.25)
+        x1 = max(0, f["x"] - pad_x)
+        y1 = max(0, f["y"] - pad_y)
+        x2 = min(w, f["x"] + f["w"] + pad_x)
+        y2 = min(h, f["y"] + f["h"] + pad_y)
+        roi = gray[y1:y2, x1:x2]
+        if roi.size > 0:
+            variance = cv2.Laplacian(roi, cv2.CV_64F).var()
+        else:
+            variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    else:
+        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    threshold = float(params.get("blur_threshold", 80.0))
     if variance < threshold:
         return {"passed": False, "message": "Photo appears blurry. Please retake with a steady camera and good focus.",
                 "meta": {"sharpness": float(variance)}}
