@@ -102,7 +102,35 @@ if ($isPassed) {
     $ext = pathinfo($_FILES['photo']['name'], PATHINFO_EXTENSION) ?: 'jpg';
     $safeExt = preg_replace('/[^a-zA-Z0-9]/', '', $ext);
     $storedName = uniqid('photo_', true) . '.' . $safeExt;
-    move_uploaded_file($_FILES['photo']['tmp_name'], $uploadsDir . '/' . $storedName);
+    $targetPath = $uploadsDir . '/' . $storedName;
+
+    // Automatically format background to studio-grade pure white (#ffffff) matching chat format
+    $editUrl = rtrim(get_setting('python_service_url', 'http://127.0.0.1:5001'), '/') . '/edit-photo';
+    $mimeType = mime_content_type($_FILES['photo']['tmp_name']) ?: 'image/jpeg';
+    $cfile = new CURLFile($_FILES['photo']['tmp_name'], $mimeType, basename($_FILES['photo']['tmp_name']));
+    $postFieldsBg = [
+        'photo' => $cfile,
+        'bg_color' => '#ffffff'
+    ];
+
+    $chBg = curl_init($editUrl);
+    curl_setopt_array($chBg, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $postFieldsBg,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 20,
+    ]);
+    $formattedBytes = curl_exec($chBg);
+    $httpCodeBg = curl_getinfo($chBg, CURLINFO_HTTP_CODE);
+    if (PHP_VERSION_ID < 80000) {
+        curl_close($chBg);
+    }
+
+    if ($httpCodeBg === 200 && !empty($formattedBytes)) {
+        file_put_contents($targetPath, $formattedBytes);
+    } else {
+        move_uploaded_file($_FILES['photo']['tmp_name'], $targetPath);
+    }
 } else {
     // Delete temporary uploaded file so failed photo is not stored/available
     if (file_exists($_FILES['photo']['tmp_name'])) {
