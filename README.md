@@ -1,0 +1,100 @@
+# University Passport Photo Verification System
+
+A production-style passport/ID photo checker for university enrollment systems.
+Students upload a photo **or** capture one live via webcam; the system runs it
+through an AI computer-vision pipeline and instantly reports pass/fail against
+criteria the admin controls.
+
+## Architecture
+
+```
+pass-check/
+  php-app/            PHP + CSS + JS web application (student portal + admin panel)
+    index.php          Student portal (upload / camera capture / results)
+    admin/              Admin login, dashboard (toggle criteria), submissions log, settings
+    api/verify.php      Bridges PHP <-> Python verification service, stores results
+    includes/           DB (SQLite via PDO), auth, shared header
+    assets/             CSS + JS
+    data/                SQLite database file (auto-created)
+    uploads/            Stored submitted photos
+
+  python-service/      Python Flask microservice — the actual computer-vision engine
+    app.py              HTTP API (/verify, /health)
+    verify.py           All CV checks (OpenCV + MediaPipe)
+    requirements.txt
+```
+
+**Why two languages?** PHP handles the web app, auth, database, and admin UI —
+but detecting glasses, counting faces, judging background whiteness, tie
+presence, head pose, blur, etc. requires real computer vision. PHP has no
+library for that, so a Python microservice (OpenCV + MediaPipe) does the
+image analysis and returns structured JSON that PHP consumes and stores.
+
+## Verification Criteria (toggle any on/off from the Admin dashboard)
+
+| Criteria | What it checks |
+|---|---|
+| Single Face Detection | Exactly one person in frame |
+| Face Size & Centering | Face properly framed, not too close/far/off-center |
+| No Eyeglasses | Flags detected eyewear |
+| Strictly White Background | Background brightness + uniformity |
+| Tie / Formal Neckwear Required | Heuristic neckwear detection below chin |
+| Minimum Resolution | Width/height thresholds |
+| Passport Size Aspect Ratio | Matches standard 35:45mm-style ratio |
+| Sharpness (No Blur) | Laplacian variance sharpness check |
+| Proper Lighting / Exposure | Rejects too dark / overexposed photos |
+| Straight Head Pose | Flags tilted/turned heads via face mesh |
+| Eyes Open | Eye-aspect-ratio check |
+
+## Setup & Run (Local / XAMPP-style)
+
+### 1. Python verification service
+
+```bash
+cd python-service
+python -m venv venv
+venv\Scripts\activate        # Windows
+pip install -r requirements.txt
+python app.py
+```
+
+Runs on `http://127.0.0.1:5001`. Verify with `http://127.0.0.1:5001/health`.
+
+> First run of MediaPipe/OpenCV installs may take a few minutes. Requires Python 3.9–3.12 (mediapipe wheels).
+
+### 2. PHP web app
+
+```bash
+cd php-app
+php -S localhost:8000
+```
+
+Then open:
+- Student portal: http://localhost:8000/
+- Admin panel: http://localhost:8000/admin/login.php
+  - Default login: `admin` / `Admin@123` (change immediately in Settings)
+
+The SQLite database (`data/database.sqlite`) and criteria/settings are
+auto-created on first request — no manual DB setup needed.
+
+### 3. Point PHP at the Python service (if not default)
+
+Admin → Settings → "Python Verification Service URL" (default `http://127.0.0.1:5001`).
+
+## Deploying to a real university server
+
+- Run the Python service as a persistent process (e.g. via `systemd`, `pm2`,
+  `gunicorn` + `nginx` reverse proxy, or Windows Task Scheduler / NSSM).
+- Serve the PHP app via Apache/Nginx + PHP-FPM (XAMPP works for a pilot).
+- Switch SQLite → MySQL by adjusting `includes/db.php` if concurrent load requires it.
+- Put both behind HTTPS; only expose the PHP app publicly — keep the Python
+  service on localhost/internal network, reachable only by the PHP server.
+- Camera capture requires HTTPS (or localhost) per browser security policy.
+
+## Security notes
+
+- Admin passwords are hashed with `password_hash()` (bcrypt).
+- File uploads are MIME-validated server-side (not just by extension).
+- The criteria enforced are always read from the server-side database — the
+  client cannot spoof which checks apply.
+- Change the default admin password before any real deployment.
