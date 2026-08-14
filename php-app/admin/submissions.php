@@ -406,6 +406,38 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function drawDynamicBackdrop(ctx, w, h, bgHex) {
+    const hex = (bgHex || '').replace('#', '');
+    const r = parseInt(hex.substring(0, 2) || 'ff', 16);
+    const g = parseInt(hex.substring(2, 4) || 'ff', 16);
+    const b = parseInt(hex.substring(4, 6) || 'ff', 16);
+
+    const cx = w * 0.5;
+    const cy = h * 0.38;
+    const radius = Math.max(w, h) * 0.82;
+
+    const grad = ctx.createRadialGradient(cx, cy, radius * 0.05, cx, cy, radius);
+
+    if ((bgHex || '').toLowerCase() === '#ffffff') {
+      grad.addColorStop(0, '#ffffff');
+      grad.addColorStop(1, '#f1f5f9');
+    } else {
+      const rInner = Math.min(255, Math.round(r * 1.12));
+      const gInner = Math.min(255, Math.round(g * 1.12));
+      const bInner = Math.min(255, Math.round(b * 1.12));
+
+      const rOuter = Math.max(0, Math.round(r * 0.88));
+      const gOuter = Math.max(0, Math.round(g * 0.88));
+      const bOuter = Math.max(0, Math.round(b * 0.88));
+
+      grad.addColorStop(0, `rgb(${rInner}, ${gInner}, ${bInner})`);
+      grad.addColorStop(1, `rgb(${rOuter}, ${gOuter}, ${bOuter})`);
+    }
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+  }
+
   function updateLivePreview() {
     const b = parseInt(brightnessRange.value, 10);
     const s = parseFloat(sharpnessRange.value);
@@ -432,10 +464,9 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Case 2: Subject cutout ready -> Instant composite (0ms, zero flash of original photo!)
+    // Case 2: Subject cutout ready -> Dynamic studio backdrop aligned with subject
     if (cutoutImage && cutoutImage.complete && cutoutImage.naturalWidth) {
-      ctx.fillStyle = targetHex;
-      ctx.fillRect(0, 0, w, h);
+      drawDynamicBackdrop(ctx, w, h, targetHex);
       ctx.drawImage(cutoutImage, 0, 0, w, h);
       return;
     }
@@ -446,10 +477,9 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Case 4: Cutout not yet loaded.
-    // Immediately fill background color on canvas so original photo never flashes!
-    ctx.fillStyle = targetHex;
-    ctx.fillRect(0, 0, w, h);
+    // Case 4: Cutout not yet loaded -> render dynamic backdrop + subject fallback
+    drawDynamicBackdrop(ctx, w, h, targetHex);
+    ctx.drawImage(editorImage, 0, 0, w, h);
 
     if (!cutoutLoading && editSubmissionId.value) {
       fetchCutout(editSubmissionId.value);

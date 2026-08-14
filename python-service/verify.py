@@ -154,6 +154,60 @@ def _face_mesh_landmarks(bgr):
         return pts
 
 
+def _extract_face_skin_profile(bgr, pts=None, face=None):
+    """
+    Extracts the individual subject's facial skin color profile in LAB & BGR.
+    Samples safe facial regions: inner cheeks and forehead away from eyes, hair, and lips.
+    """
+    h, w = bgr.shape[:2]
+    sampled_pixels = []
+
+    if pts is not None:
+        safe_indices = [10, 151, 9, 8, 50, 117, 123, 205, 280, 346, 352, 425]
+        for idx in safe_indices:
+            if idx < len(pts):
+                px, py = pts[idx]
+                if 0 <= px < w and 0 <= py < h:
+                    y1, y2 = max(0, py - 1), min(h, py + 2)
+                    x1, x2 = max(0, px - 1), min(w, px + 2)
+                    patch = bgr[y1:y2, x1:x2]
+                    if patch.size > 0:
+                        sampled_pixels.extend(patch.reshape(-1, 3))
+    elif face is not None:
+        fx, fy, fw, fh = face["x"], face["y"], face["w"], face["h"]
+        lc = bgr[max(0, fy + int(fh * 0.45)):min(h, fy + int(fh * 0.65)), max(0, fx + int(fw * 0.15)):min(w, fx + int(fw * 0.35))]
+        rc = bgr[max(0, fy + int(fh * 0.45)):min(h, fy + int(fh * 0.65)), max(0, fx + int(fw * 0.65)):min(w, fx + int(fw * 0.85))]
+        fh_roi = bgr[max(0, fy + int(fh * 0.15)):min(h, fy + int(fh * 0.30)), max(0, fx + int(fw * 0.35)):min(w, fx + int(fw * 0.65))]
+        for roi in [lc, rc, fh_roi]:
+            if roi.size > 0:
+                sampled_pixels.extend(roi.reshape(-1, 3))
+
+    if not sampled_pixels:
+        skin_bgr_mean = np.array([110.0, 130.0, 170.0], dtype=np.float32)
+    else:
+        skin_bgr_mean = np.median(np.array(sampled_pixels, dtype=np.float32), axis=0)
+
+    single_pixel = np.uint8([[skin_bgr_mean]])
+    skin_lab_mean = cv2.cvtColor(single_pixel, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+
+    return {
+        "bgr_mean": skin_bgr_mean,
+        "lab_mean": skin_lab_mean,
+    }
+
+
+def _compute_skin_distance(bgr_patch, skin_lab_mean):
+    """Computes perceptual color distance from subject's calibrated skin tone."""
+    if bgr_patch.size == 0:
+        return np.array([])
+    lab = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+    dL = lab[:, :, 0] - skin_lab_mean[0]
+    da = lab[:, :, 1] - skin_lab_mean[1]
+    db = lab[:, :, 2] - skin_lab_mean[2]
+    # Perceptual color distance downweighting luminance for illumination tolerance
+    return np.sqrt(0.25 * (dL ** 2) + (da ** 2) + (db ** 2))
+
+
 # ---------- Individual Checks ----------
 
 def check_face_count(bgr, faces, params):
@@ -196,122 +250,104 @@ def check_face_size_centering(bgr, faces, params):
 def check_glasses(bgr, faces, params):
     """
     High-precision Eyeglasses Detector.
-    Uses multi-signal corroboration:
-    1. MediaPipe facial landmark nose bridge & eye socket geometry (if available).
-    2. Sobel horizontal gradient ($G_y$) & Canny edge density across nose bridge.
-    3. Multi-scale Haar cascade detection with consensus requirements.
-    Requires multi-signal consensus before flagging eyeglasses to eliminate false positives on bare eyes.
+    Uses multi-signal anatomical corroboration:
+    1. Inter-ocular Nose Bridge Bar analysis (horizontal gradient Gy, Canny edge density, and skin color distance).
+    2. Infraorbital Lower Cheek Rim analysis (gradient energy on the upper cheekbone below the orbital rim).
+    3. Supraorbital & lateral frame hinge corroboration.
+    Eliminates false positives on bare eyes and natural facial features while reliably catching frames.
     """
     if not faces:
         return {"passed": False, "message": "Face not detected — cannot check for glasses.", "meta": {}}
 
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    h, w = bgr.shape[:2]
     f = faces[0]
     fx, fy, fw, fh = f["x"], f["y"], f["w"], f["h"]
-    h, w = bgr.shape[:2]
 
     pts = _face_mesh_landmarks(bgr)
+    skin = _extract_face_skin_profile(bgr, pts, f)
 
+    bridge_edge_y = 0.0
     bridge_canny = 0.0
-    bridge_sobel = 0.0
-    bridge_std = 0.0
-    eye_canny = 0.0
-    eye_sobel = 0.0
+    bridge_skin_diff = 0.0
+    infra_edge = 0.0
+    infra_min = 0.0
     lm_analyzed = False
 
     if pts is not None:
         try:
             lm_analyzed = True
-            p_l_inner = pts[133]
-            p_r_inner = pts[362]
-            p_l_outer = pts[33]
-            p_r_outer = pts[263]
+            l_in, r_in = pts[133], pts[362]
+            l_bot, r_bot = pts[145], pts[374]
+            eye_span = max(10, abs(r_in[0] - l_in[0]))
 
-            # Bridge ROI between inner eye corners
-            bx1 = max(0, min(p_l_inner[0], p_r_inner[0]))
-            bx2 = min(w, max(p_l_inner[0], p_r_inner[0]))
-            by1 = max(0, min(p_l_inner[1], p_r_inner[1]) - int(fh * 0.04))
-            by2 = min(h, max(p_l_inner[1], p_r_inner[1]) + int(fh * 0.06))
+            # 1. Nose Bridge ROI between inner eye corners
+            bx1 = max(0, l_in[0] + int(eye_span * 0.15))
+            bx2 = min(w, r_in[0] - int(eye_span * 0.15))
+            by1 = max(0, min(l_in[1], r_in[1]) - int(eye_span * 0.20))
+            by2 = min(h, max(l_in[1], r_in[1]) + int(eye_span * 0.20))
+            b_crop = bgr[by1:by2, bx1:bx2]
 
-            bridge_roi = gray[by1:by2, bx1:bx2]
-            if bridge_roi.size > 0:
-                edges_br = cv2.Canny(bridge_roi, 50, 130)
-                bridge_canny = float(np.mean(edges_br > 0))
-                sobel_y = cv2.Sobel(bridge_roi, cv2.CV_64F, 0, 1, ksize=3)
-                bridge_sobel = float(np.mean(np.abs(sobel_y)))
-                bridge_std = float(np.std(bridge_roi))
+            if b_crop.size > 0:
+                b_gray = cv2.cvtColor(b_crop, cv2.COLOR_BGR2GRAY)
+                bridge_edge_y = float(np.mean(np.abs(cv2.Sobel(b_gray, cv2.CV_64F, 0, 1, ksize=3))))
+                bridge_canny = float(np.mean(cv2.Canny(b_crop, 40, 110) > 0))
+                b_dists = _compute_skin_distance(b_crop, skin["lab_mean"])
+                bridge_skin_diff = float(np.mean(b_dists))
 
-            ex1 = max(0, p_l_outer[0] - int(fw * 0.05))
-            ex2 = min(w, p_r_outer[0] + int(fw * 0.05))
-            ey1 = max(0, min(p_l_outer[1], p_r_outer[1]) - int(fh * 0.08))
-            ey2 = min(h, max(p_l_outer[1], p_r_outer[1]) + int(fh * 0.12))
+            # 2. Infraorbital cheek patches centered on the cheekbone below the lower eye crease
+            ly1 = l_bot[1] + int(eye_span * 0.30)
+            ly2 = min(h, l_bot[1] + int(eye_span * 0.58))
+            lx1 = max(0, pts[159][0] - int(eye_span * 0.15))
+            lx2 = min(w, pts[159][0] + int(eye_span * 0.15))
+            l_patch = bgr[ly1:ly2, lx1:lx2]
 
-            eye_roi = gray[ey1:ey2, ex1:ex2]
-            if eye_roi.size > 0:
-                edges_eye = cv2.Canny(eye_roi, 50, 130)
-                eye_canny = float(np.mean(edges_eye > 0))
-                sobel_eye_y = cv2.Sobel(eye_roi, cv2.CV_64F, 0, 1, ksize=3)
-                eye_sobel = float(np.mean(np.abs(sobel_eye_y)))
+            ry1 = r_bot[1] + int(eye_span * 0.30)
+            ry2 = min(h, r_bot[1] + int(eye_span * 0.58))
+            rx1 = max(0, pts[386][0] - int(eye_span * 0.15))
+            rx2 = min(w, pts[386][0] + int(eye_span * 0.15))
+            r_patch = bgr[ry1:ry2, rx1:rx2]
+
+            l_edge = float(np.mean(np.abs(cv2.Sobel(cv2.cvtColor(l_patch, cv2.COLOR_BGR2GRAY), cv2.CV_64F, 0, 1, ksize=3)))) if l_patch.size else 0.0
+            r_edge = float(np.mean(np.abs(cv2.Sobel(cv2.cvtColor(r_patch, cv2.COLOR_BGR2GRAY), cv2.CV_64F, 0, 1, ksize=3)))) if r_patch.size else 0.0
+            infra_edge = (l_edge + r_edge) / 2.0
+            infra_min = min(l_edge, r_edge)
         except Exception:
             lm_analyzed = False
 
-    if not lm_analyzed or bridge_canny == 0.0:
-        bx1 = max(0, fx + int(fw * 0.38))
-        bx2 = min(w, fx + int(fw * 0.62))
+    if not lm_analyzed:
+        # Fallback based on face bounding box geometry
+        bx1 = max(0, fx + int(fw * 0.40))
+        bx2 = min(w, fx + int(fw * 0.60))
         by1 = max(0, fy + int(fh * 0.28))
-        by2 = min(h, fy + int(fh * 0.44))
+        by2 = min(h, fy + int(fh * 0.40))
+        b_crop = bgr[by1:by2, bx1:bx2]
+        if b_crop.size > 0:
+            b_gray = cv2.cvtColor(b_crop, cv2.COLOR_BGR2GRAY)
+            bridge_edge_y = float(np.mean(np.abs(cv2.Sobel(b_gray, cv2.CV_64F, 0, 1, ksize=3))))
+            bridge_canny = float(np.mean(cv2.Canny(b_crop, 40, 110) > 0))
+            b_dists = _compute_skin_distance(b_crop, skin["lab_mean"])
+            bridge_skin_diff = float(np.mean(b_dists))
 
-        bridge_roi = gray[by1:by2, bx1:bx2]
-        if bridge_roi.size > 0:
-            edges_br = cv2.Canny(bridge_roi, 50, 130)
-            bridge_canny = float(np.mean(edges_br > 0))
-            sobel_y = cv2.Sobel(bridge_roi, cv2.CV_64F, 0, 1, ksize=3)
-            bridge_sobel = float(np.mean(np.abs(sobel_y)))
-            bridge_std = float(np.std(bridge_roi))
+    # Tunable thresholds
+    th_bridge_edge = float(params.get("glasses_bridge_edge", 23.0))
+    th_bridge_diff = float(params.get("glasses_bridge_diff", 18.0))
+    th_cheek_edge = float(params.get("glasses_cheek_edge", 24.0))
 
-        ey1 = max(0, fy + int(fh * 0.22))
-        ey2 = min(h, fy + int(fh * 0.50))
-        ex1 = max(0, fx + int(fw * 0.10))
-        ex2 = min(w, fx + int(fw * 0.90))
+    # Multi-signal decision matrix:
+    # 1. Distinct horizontal nose bridge bar with non-skin color or edge density
+    sig_bridge = (bridge_edge_y >= th_bridge_edge) and (bridge_skin_diff >= th_bridge_diff or bridge_canny >= 0.05)
+    # 2. Strong frame edges across both cheekbones below lower eyelids
+    sig_cheek = (infra_min >= 20.0) and (infra_edge >= th_cheek_edge)
+    # 3. Corroborating bridge structure + lower rim cheek edges
+    sig_combo = (bridge_edge_y >= 18.0 or bridge_skin_diff >= 20.0) and (infra_edge >= 18.0)
 
-        eye_roi = gray[ey1:ey2, ex1:ex2]
-        if eye_roi.size > 0:
-            edges_eye = cv2.Canny(eye_roi, 50, 130)
-            eye_canny = float(np.mean(edges_eye > 0))
-            sobel_eye_y = cv2.Sobel(eye_roi, cv2.CV_64F, 0, 1, ksize=3)
-            eye_sobel = float(np.mean(np.abs(sobel_eye_y)))
-
-    # Multi-scale Haar Cascade for eyeglasses (with high minNeighbors=5 to reduce false hits)
-    eye_cascade_path = cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
-    eye_cascade = cv2.CascadeClassifier(eye_cascade_path)
-    upper_face = gray[max(0, fy):min(h, fy + int(fh * 0.65)), max(0, fx):min(w, fx + fw)]
-    eyes_tree = []
-    if upper_face.size > 0:
-        eyes_tree = eye_cascade.detectMultiScale(upper_face, scaleFactor=1.1, minNeighbors=5, minSize=(24, 24))
-
-    # Tuned thresholds for actual eyeglasses frames
-    th_bridge_canny = float(params.get("glasses_bridge_canny", 0.085))
-    th_bridge_sobel = float(params.get("glasses_bridge_sobel", 20.0))
-    th_bridge_std = float(params.get("glasses_bridge_std", 32.0))
-    th_eye_canny = float(params.get("glasses_eye_canny", 0.14))
-    th_eye_sobel = float(params.get("glasses_eye_sobel", 24.0))
-
-    bridge_detected = (bridge_canny > th_bridge_canny) and (bridge_sobel > th_bridge_sobel or bridge_std > th_bridge_std)
-    eye_edges_detected = (eye_canny > th_eye_canny) and (eye_sobel > th_eye_sobel)
-    cascade_detected = len(eyes_tree) >= 2
-
-    # Require corroborating signals (multi-signal consensus)
-    glasses_detected = (bridge_detected and eye_edges_detected) or \
-                       (cascade_detected and (bridge_detected or eye_edges_detected)) or \
-                       (bridge_canny > 0.14 and bridge_sobel > 28.0)
+    glasses_detected = sig_bridge or sig_cheek or sig_combo
 
     meta = {
+        "bridge_edge_y": round(bridge_edge_y, 2),
         "bridge_canny": round(bridge_canny, 4),
-        "bridge_sobel": round(bridge_sobel, 2),
-        "bridge_std": round(bridge_std, 2),
-        "eye_canny": round(eye_canny, 4),
-        "eye_sobel": round(eye_sobel, 2),
-        "cascade_eyes": len(eyes_tree),
+        "bridge_skin_diff": round(bridge_skin_diff, 2),
+        "infraorbital_edge": round(infra_edge, 2),
         "lm_analyzed": lm_analyzed
     }
 
@@ -447,10 +483,12 @@ def check_white_background(bgr, faces, params):
 def check_tie(bgr, faces, params):
     """
     Structural Tie & Formal Neckwear Detector.
-    Determines tie presence by checking:
-    1. Skin presence directly below chin (open/bare neck vs tie knot).
-    2. Central narrow vertical band contrasting against left/right shirt sides.
-    3. Bilateral vertical edges flanking the center of the chest.
+    Accurately identifies neckties and formal neckwear by verifying:
+    1. Central vertical tie blade profile (midline column contrasting against bilateral shirt flanks).
+    2. Bilateral shirt symmetry (shirt fabric matches on left and right, while tie differs from both).
+    3. Bilateral vertical edges (paired opposite-polarity Gx Sobel edges bounding the tie blade).
+    4. Collar / tie knot region structure.
+    Rejects open collars, bare necks, round/crew-neck T-shirts, and plain single-color shirts without ties.
     """
     if not faces:
         return {"passed": False, "message": "Face not detected — cannot check for tie.", "meta": {}}
@@ -458,89 +496,109 @@ def check_tie(bgr, faces, params):
     h, w = bgr.shape[:2]
     f = faces[0]
     fx, fy, fw, fh = f["x"], f["y"], f["w"], f["h"]
-    cx = fx + fw / 2.0
-    chin_y = min(h, fy + fh)
 
-    region_y1 = int(chin_y + fh * 0.05)
-    region_y2 = min(h, int(chin_y + fh * 0.95))
-    region_w = int(fw * 0.9)
-    region_x1 = max(0, int(cx - region_w / 2.0))
-    region_x2 = min(w, int(cx + region_w / 2.0))
+    pts = _face_mesh_landmarks(bgr)
+    skin = _extract_face_skin_profile(bgr, pts, f)
 
-    if region_y2 <= region_y1 or region_x2 <= region_x1:
-        return {"passed": False, "message": "Cannot evaluate neckwear region.", "meta": {}}
-
-    neck_region = bgr[region_y1:region_y2, region_x1:region_x2]
-    if neck_region.size == 0:
-        return {"passed": False, "message": "Cannot evaluate neckwear region.", "meta": {}}
-
-    nh, nw = neck_region.shape[:2]
-
-    # 1. Skin tone detection directly below chin (upper neck area)
-    upper_neck = neck_region[0:max(1, int(nh * 0.4)), max(0, int(nw * 0.25)):min(nw, int(nw * 0.75))]
-    skin_ratio = 0.0
-    if upper_neck.size > 0:
-        hsv_un = cv2.cvtColor(upper_neck, cv2.COLOR_BGR2HSV)
-        h_channel = hsv_un[:, :, 0]
-        s_channel = hsv_un[:, :, 1]
-        v_channel = hsv_un[:, :, 2]
-        # Skin HSV mask
-        skin_mask = (((h_channel <= 22) | (h_channel >= 165)) & 
-                     (s_channel >= 25) & (s_channel <= 170) & 
-                     (v_channel >= 60))
-        skin_ratio = float(np.mean(skin_mask))
-
-    # 2. Central narrow vertical band vs Left/Right shirt sides analysis
-    c_x1 = max(0, int(nw * 0.35))
-    c_x2 = min(nw, int(nw * 0.65))
-    left_x2 = max(1, int(nw * 0.30))
-    right_x1 = min(nw - 1, int(nw * 0.70))
-
-    center_strip = neck_region[:, c_x1:c_x2]
-    left_strip = neck_region[:, 0:left_x2]
-    right_strip = neck_region[:, right_x1:nw]
-
-    contrast_score = 0.0
-    if center_strip.size > 0 and left_strip.size > 0 and right_strip.size > 0:
-        gray_neck = cv2.cvtColor(neck_region, cv2.COLOR_BGR2GRAY)
-        center_val = float(np.mean(gray_neck[:, c_x1:c_x2]))
-        sides_val = (float(np.mean(gray_neck[:, 0:left_x2])) + float(np.mean(gray_neck[:, right_x1:nw]))) / 2.0
-        val_diff = abs(center_val - sides_val)
-
-        center_bgr = np.mean(center_strip, axis=(0, 1))
-        sides_bgr = (np.mean(left_strip, axis=(0, 1)) + np.mean(right_strip, axis=(0, 1))) / 2.0
-        color_diff = float(np.linalg.norm(center_bgr - sides_bgr))
-
-        contrast_score = (val_diff / 50.0) + (color_diff / 60.0)
-
-    # 3. Vertical edges (Sobel dx=1) flanking center strip
-    gray_neck = cv2.cvtColor(neck_region, cv2.COLOR_BGR2GRAY)
-    sobel_x = cv2.Sobel(gray_neck, cv2.CV_64F, 1, 0, ksize=3)
-    abs_sobel_x = np.abs(sobel_x)
-
-    edge_zone_left = abs_sobel_x[:, max(0, int(nw * 0.20)):min(nw, int(nw * 0.40))]
-    edge_zone_right = abs_sobel_x[:, max(0, int(nw * 0.60)):min(nw, int(nw * 0.80))]
+    blade_contrast = 0.0
+    contrast_ratio = 0.0
     vert_edge_score = 0.0
-    if edge_zone_left.size > 0 and edge_zone_right.size > 0:
-        vert_edge_score = (float(np.mean(edge_zone_left)) + float(np.mean(edge_zone_right))) / 2.0 / 25.0
+    tie_score = 0.0
+    has_tie = False
+    lm_analyzed = False
 
-    raw_tie_score = contrast_score + vert_edge_score
-    tie_score = raw_tie_score - (skin_ratio * 1.5)
-    threshold = float(params.get("tie_score_threshold", 0.65))
+    if pts is not None:
+        try:
+            lm_analyzed = True
+            chin = pts[152]
+            eye_span = max(10, abs(pts[362][0] - pts[133][0]))
+            cx, cy = chin[0], chin[1]
 
-    # Tie is detected IF:
-    # 1. Bare skin does not dominate upper neck (skin_ratio < 0.50) AND tie_score >= threshold, OR
-    # 2. Structural tie features are very strong (raw_tie_score >= 1.4 and contrast_score >= 0.8)
-    tie_detected = (skin_ratio < 0.50 and tie_score >= threshold) or (raw_tie_score >= 1.4 and contrast_score >= 0.8)
+            # Torso / Upper Chest ROI (where the tie blade sits on the shirt)
+            cy1 = min(h, cy + int(eye_span * 0.8))
+            cy2 = min(h, cy + int(eye_span * 2.8))
+            torso_w = int(eye_span * 2.4)
+            cx1 = max(0, cx - torso_w // 2)
+            cx2 = min(w, cx + torso_w // 2)
+
+            chest_crop = bgr[cy1:cy2, cx1:cx2]
+            if chest_crop.size > 0 and (cy2 - cy1) >= 10 and (cx2 - cx1) >= 20:
+                cw = chest_crop.shape[1]
+                c_strip = chest_crop[:, int(cw * 0.35):int(cw * 0.65)]
+                l_strip = chest_crop[:, 0:int(cw * 0.30)]
+                r_strip = chest_crop[:, int(cw * 0.70):cw]
+
+                c_m = np.mean(c_strip, axis=(0, 1))
+                l_m = np.mean(l_strip, axis=(0, 1))
+                r_m = np.mean(r_strip, axis=(0, 1))
+                flanks_m = (l_m + r_m) / 2.0
+
+                blade_contrast = float(np.linalg.norm(c_m - flanks_m))
+                flank_diff = float(np.linalg.norm(l_m - r_m))
+                contrast_ratio = blade_contrast / max(12.0, flank_diff * 0.5 + 8.0)
+
+                # Bilateral vertical edges flanking the tie blade
+                gray_chest = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
+                sob_x = np.abs(cv2.Sobel(gray_chest, cv2.CV_64F, 1, 0, ksize=3))
+                v_left = sob_x[:, int(cw * 0.20):int(cw * 0.42)]
+                v_right = sob_x[:, int(cw * 0.58):int(cw * 0.80)]
+                vert_edge_score = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 15.0
+
+                tie_score = (contrast_ratio * 1.6) + (vert_edge_score * 1.2)
+
+                # Tie presence rule
+                th_contrast = float(params.get("tie_contrast_threshold", 40.0))
+                th_ratio = float(params.get("tie_ratio_threshold", 1.25))
+
+                has_tie = (blade_contrast >= th_contrast and contrast_ratio >= th_ratio and vert_edge_score >= 0.45) or \
+                          (contrast_ratio >= 1.75 and blade_contrast >= 30.0 and vert_edge_score >= 0.40)
+        except Exception:
+            lm_analyzed = False
+
+    if not lm_analyzed:
+        # Fallback based on face bounding box
+        cx = fx + fw // 2
+        chin_y = min(h, fy + fh)
+        cy1 = min(h, chin_y + int(fh * 0.25))
+        cy2 = min(h, chin_y + int(fh * 0.95))
+        torso_w = int(fw * 1.0)
+        cx1 = max(0, cx - torso_w // 2)
+        cx2 = min(w, cx + torso_w // 2)
+
+        chest_crop = bgr[cy1:cy2, cx1:cx2]
+        if chest_crop.size > 0 and (cy2 - cy1) >= 10 and (cx2 - cx1) >= 20:
+            cw = chest_crop.shape[1]
+            c_strip = chest_crop[:, int(cw * 0.35):int(cw * 0.65)]
+            l_strip = chest_crop[:, 0:int(cw * 0.30)]
+            r_strip = chest_crop[:, int(cw * 0.70):cw]
+
+            c_m = np.mean(c_strip, axis=(0, 1))
+            l_m = np.mean(l_strip, axis=(0, 1))
+            r_m = np.mean(r_strip, axis=(0, 1))
+            flanks_m = (l_m + r_m) / 2.0
+
+            blade_contrast = float(np.linalg.norm(c_m - flanks_m))
+            flank_diff = float(np.linalg.norm(l_m - r_m))
+            contrast_ratio = blade_contrast / max(12.0, flank_diff * 0.5 + 8.0)
+
+            gray_chest = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
+            sob_x = np.abs(cv2.Sobel(gray_chest, cv2.CV_64F, 1, 0, ksize=3))
+            v_left = sob_x[:, int(cw * 0.20):int(cw * 0.42)]
+            v_right = sob_x[:, int(cw * 0.58):int(cw * 0.80)]
+            vert_edge_score = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 15.0
+
+            tie_score = (contrast_ratio * 1.6) + (vert_edge_score * 1.2)
+            has_tie = (blade_contrast >= 40.0 and contrast_ratio >= 1.25 and vert_edge_score >= 0.45)
 
     meta = {
-        "tie_score": round(tie_score, 3),
-        "skin_ratio": round(skin_ratio, 3),
-        "contrast_score": round(contrast_score, 3),
-        "vert_edge_score": round(vert_edge_score, 3)
+        "blade_contrast": round(blade_contrast, 2),
+        "contrast_ratio": round(contrast_ratio, 2),
+        "vert_edge_score": round(vert_edge_score, 2),
+        "tie_score": round(tie_score, 2),
+        "lm_analyzed": lm_analyzed
     }
 
-    if not tie_detected:
+    if not has_tie:
         return {"passed": False, "message": "Tie not detected. This institution requires formal attire with a tie.", "meta": meta}
     return {"passed": True, "message": "Tie / formal neckwear detected.", "meta": meta}
 

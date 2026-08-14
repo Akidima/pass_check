@@ -135,14 +135,38 @@ def get_subject_cutout(pil_img):
         return pil_img.convert("RGBA")
 
 
+def _create_dynamic_backdrop(width, height, target_rgb, center_x=None, center_y=None):
+    """
+    Generate a dynamic studio backdrop with soft radial key lighting aligned with the subject.
+    """
+    R, G, B = target_rgb
+    cx = center_x if center_x is not None else width * 0.5
+    cy = center_y if center_y is not None else height * 0.38
+
+    Y, X = np.ogrid[:height, :width]
+    diag = np.sqrt(width**2 + height**2)
+    dist = np.sqrt((X - cx)**2 + (Y - cy)**2) / max(1.0, diag)
+
+    if R > 245 and G > 245 and B > 245:
+        # High-Key Biometric Studio White
+        lum = 1.0 - 0.035 * (dist ** 1.2)
+    else:
+        # Dynamic Studio Key Light Spotlight (+12% center hotspot, -12% perimeter)
+        lum = 1.12 - 0.24 * (dist ** 1.2)
+
+    bg = np.zeros((height, width, 3), dtype=np.float32)
+    bg[:, :, 0] = np.clip(R * lum, 0, 255)
+    bg[:, :, 1] = np.clip(G * lum, 0, 255)
+    bg[:, :, 2] = np.clip(B * lum, 0, 255)
+    return bg
+
+
 def replace_background_color(pil_img, hex_color):
     """
-    AnyEraser-style AI Deep Learning Background Removal & Color Replacement.
-    Isolates the subject/person completely using U2-Net deep learning portrait segmentation,
-    removes 100% of the entire original background behind the person, and composites
-    the person onto a new solid canvas of the target hex_color.
-    Face, skin, hair, shirt, suit, and tie are 100% protected and NEVER recolored.
-    - hex_color: string (e.g. '#ffffff', '#3b82f6', '#ef4444')
+    Dynamic AI Background Replacement & Studio Lighting Alignment:
+    1. Isolates subject with smooth alpha matting.
+    2. Generates dynamic studio backdrop aligned behind the subject.
+    3. Harmonizes edge fringe with subtle light wrap for seamless integration.
     """
     if not hex_color or str(hex_color).strip().lower() in ("", "none", "keep", "original", "transparent"):
         return pil_img
@@ -157,19 +181,96 @@ def replace_background_color(pil_img, hex_color):
         return pil_img
 
     cutout_rgba = get_subject_cutout(pil_img)
-    bg_canvas = Image.new("RGBA", cutout_rgba.size, target_rgb + (255,))
-    composite = Image.alpha_composite(bg_canvas, cutout_rgba)
-    return composite.convert("RGB")
+    cutout_arr = np.array(cutout_rgba)
+    if cutout_arr.ndim != 3 or cutout_arr.shape[2] != 4:
+        return pil_img
+
+    w, h = cutout_rgba.size
+    alpha = cutout_arr[:, :, 3].astype(np.float32) / 255.0
+
+    # Locate subject head center for dynamic background alignment
+    center_x = w * 0.5
+    center_y = h * 0.38
+    try:
+        bgr = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        faces = _detect_faces(bgr)
+        if faces:
+            f = faces[0]
+            center_x = f["x"] + f["w"] * 0.5
+            center_y = f["y"] + f["h"] * 0.45
+    except Exception:
+        pass
+
+    # Dynamic studio backdrop aligned with subject's position
+    bg_layer = _create_dynamic_backdrop(w, h, target_rgb, center_x, center_y)
+
+    fg_rgb = cutout_arr[:, :, :3].astype(np.float32)
+
+    # Dynamic Light Wrap / Edge Harmonization on boundary transition zone
+    fringe = (alpha > 0.05) & (alpha < 0.85)
+    if np.any(fringe):
+        wrap_factor = (1.0 - alpha[fringe]) * 0.18
+        for c in range(3):
+            fg_rgb[fringe, c] = fg_rgb[fringe, c] * (1.0 - wrap_factor) + bg_layer[fringe, c] * wrap_factor
+
+    # Alpha composite
+    comp = fg_rgb * alpha[:, :, np.newaxis] + bg_layer * (1.0 - alpha[:, :, np.newaxis])
+    comp = np.clip(comp, 0, 255).astype(np.uint8)
+    return Image.fromarray(comp, mode="RGB")
+
+
+def _apply_gamma_brightness(pil_img, brightness_value):
+    """
+    Apply brightness adjustment with gamma curve in LAB luminance space.
+    """
+    if brightness_value == 0:
+        return pil_img
+
+    b = float(brightness_value)
+    gamma = 1.0 / (1.0 + b / 80.0) if b > 0 else 1.0 + abs(b) / 80.0
+    gamma = max(0.3, min(3.0, gamma))
+
+    arr = np.array(pil_img.convert("RGB"))
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L = lab[:, :, 0] / 255.0
+    L_gamma = np.power(L, gamma)
+    lab[:, :, 0] = np.clip(L_gamma * 255.0, 0, 255)
+
+    result = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return Image.fromarray(result, mode="RGB")
+
+
+def _apply_unsharp_mask(pil_img, sharpness_value):
+    """
+    Apply responsive photographic high-pass unsharp mask on luminance.
+    """
+    s = float(sharpness_value)
+    if s <= 1.0:
+        return pil_img
+
+    strength = min(2.5, (s - 1.0) * 1.5)
+    arr = np.array(pil_img.convert("RGB"))
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L = lab[:, :, 0]
+
+    h, w = L.shape[:2]
+    radius = max(1.2, min(w, h) / 450.0)
+    ksize = int(radius * 3.0) | 1
+    ksize = max(3, ksize)
+
+    L_blurred = cv2.GaussianBlur(L, (ksize, ksize), radius)
+    detail = L - L_blurred
+    detail[np.abs(detail) < 0.5] = 0.0
+
+    lab[:, :, 0] = np.clip(L + strength * detail, 0, 255)
+    result = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return Image.fromarray(result, mode="RGB")
 
 
 def process_photo_edits(image_bytes, brightness=0.0, width=None, height=None, sharpness=1.0, bg_color=None):
     """
-    Applies brightness, resolution resize, sharpness, and background color adjustments to an image.
-    - brightness: float offset (-100 to +100) or factor (e.g. 1.0 = default)
-    - width, height: target dimensions in pixels (optional)
-    - sharpness: factor (1.0 = default, > 1.0 sharpens, e.g. 1.5 - 3.0)
-    - bg_color: hex string (e.g. '#ffffff', '#3b82f6')
-    Returns: JPEG image bytes
+    Applies background replacement (with dynamic studio lighting & light wrap),
+    gamma brightness, photographic sharpness, and optional resizing.
     """
     pil_img = Image.open(io.BytesIO(image_bytes))
     try:
@@ -179,31 +280,25 @@ def process_photo_edits(image_bytes, brightness=0.0, width=None, height=None, sh
         pass
     pil_img = pil_img.convert("RGB")
 
-    # 1. Sharpness adjustment on original subject before background replacement
-    try:
-        s_val = float(sharpness)
-        if s_val != 1.0 and s_val >= 0:
-            enhancer = ImageEnhance.Sharpness(pil_img)
-            pil_img = enhancer.enhance(s_val)
-    except (ValueError, TypeError):
-        pass
+    # 1. Background Color Replacement with dynamic studio lighting & light wrap
+    if bg_color:
+        pil_img = replace_background_color(pil_img, bg_color)
 
     # 2. Brightness adjustment
     try:
         b_val = float(brightness)
-        if b_val != 0.0:
-            if -100 <= b_val <= 100 and b_val != 1.0:
-                factor = max(0.1, 1.0 + (b_val / 100.0))
-            else:
-                factor = max(0.1, b_val)
-            enhancer = ImageEnhance.Brightness(pil_img)
-            pil_img = enhancer.enhance(factor)
+        if b_val != 0.0 and -100 <= b_val <= 100:
+            pil_img = _apply_gamma_brightness(pil_img, b_val)
     except (ValueError, TypeError):
         pass
 
-    # 3. Background Color Replacement (pure solid canvas composite)
-    if bg_color:
-        pil_img = replace_background_color(pil_img, bg_color)
+    # 3. Sharpness adjustment
+    try:
+        s_val = float(sharpness)
+        if s_val > 1.0:
+            pil_img = _apply_unsharp_mask(pil_img, s_val)
+    except (ValueError, TypeError):
+        pass
 
     # 4. Resolution / Resizing
     if width and height:
@@ -216,7 +311,7 @@ def process_photo_edits(image_bytes, brightness=0.0, width=None, height=None, sh
             pass
 
     out_buf = io.BytesIO()
-    pil_img.save(out_buf, format="JPEG", quality=95)
+    pil_img.save(out_buf, format="JPEG", quality=96, subsampling=0)
     return out_buf.getvalue()
 
 
