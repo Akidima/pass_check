@@ -6,3 +6,5 @@ Pillow>=10.4
 rembg>=2.0.60
 onnxruntime>=1.19.0
 mediapipe==0.10.14
+torch
+torchvision

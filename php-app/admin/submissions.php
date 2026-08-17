@@ -56,7 +56,7 @@ include __DIR__ . '/../includes/header.php';
             <tr id="row-<?= (int)$s['id'] ?>">
               <td>
                 <img id="thumb-<?= (int)$s['id'] ?>" src="/uploads/<?= htmlspecialchars($s['filename']) ?>"
-                     style="width:52px;height:52px;object-fit:cover;border-radius:8px;border:1px solid var(--navy-600);" alt="">
+                     style="width:52px;height:52px;object-fit:cover;border-radius:8px;border:2px solid var(--navy-600);background:repeating-conic-gradient(rgba(255,255,255,0.06) 0% 25%, transparent 0% 50%) 0 0/10px 10px, var(--navy-900);box-shadow:0 2px 8px -2px rgba(0,0,0,0.5);" alt="">
               </td>
               <td>
                 <strong><?= htmlspecialchars($s['student_name'] ?: '—') ?></strong><br>
@@ -287,10 +287,14 @@ include __DIR__ . '/../includes/header.php';
   height: 260px;
   border-radius: var(--radius-sm);
   overflow: hidden;
-  background: var(--navy-950);
+  background:
+    repeating-conic-gradient(rgba(255,255,255,0.05) 0% 25%, transparent 0% 50%) 0 0 / 14px 14px,
+    var(--navy-950);
+  border: 2px solid var(--navy-700);
   display: flex;
   align-items: center;
   justify-content: center;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35);
 }
 .img-container canvas {
   max-width: 100%;

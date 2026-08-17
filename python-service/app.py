@@ -11,20 +11,29 @@ Service listens on http://127.0.0.1:5001
 import io
 import json
 import os
+import threading
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 import cv2
 import numpy as np
 from verify import run_checks, CHECK_LABELS, _detect_faces
 
 try:
     from rembg import new_session as rembg_new_session, remove as rembg_remove
-    REMBG_SESSION = rembg_new_session('u2net')
     REMBG_AVAILABLE = True
 except Exception:
-    REMBG_SESSION = None
+    rembg_new_session = None
+    rembg_remove = None
     REMBG_AVAILABLE = False
+
+# Verification never needs U2-Net segmentation. Keeping its model load lazy
+# prevents an optional photo-edit feature from adding cold-start latency or a
+# model-download failure to the student validation endpoint. The one session is
+# then safely cached for all later edit requests in this process.
+REMBG_SESSION = None
+_REMBG_INIT_ATTEMPTED = False
+_REMBG_LOCK = threading.Lock()
 
 app = Flask(__name__)
 CORS(app)
@@ -33,17 +42,34 @@ MAX_UPLOAD_MB = 12
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
+def get_rembg_session():
+    """Load the optional U2-Net session once, only when background editing needs it."""
+    global REMBG_SESSION, _REMBG_INIT_ATTEMPTED
+    if not REMBG_AVAILABLE:
+        return None
+    with _REMBG_LOCK:
+        if not _REMBG_INIT_ATTEMPTED:
+            _REMBG_INIT_ATTEMPTED = True
+            try:
+                REMBG_SESSION = rembg_new_session('u2net')
+            except Exception:
+                REMBG_SESSION = None
+    return REMBG_SESSION
+
+
 def get_subject_cutout(pil_img):
     """
     Isolates the subject/person completely using U2-Net deep learning portrait segmentation (rembg)
     or OpenCV GrabCut/FloodFill fallback, returning a PIL Image in RGBA mode with a transparent background.
     """
+    pil_img = ImageOps.exif_transpose(pil_img)
     pil_img_rgb = pil_img.convert("RGB")
 
     cutout_img = None
-    if REMBG_AVAILABLE and REMBG_SESSION is not None:
+    rembg_session = get_rembg_session()
+    if rembg_session is not None:
         try:
-            cutout_img = rembg_remove(pil_img_rgb, session=REMBG_SESSION)
+            cutout_img = rembg_remove(pil_img_rgb, session=rembg_session)
         except Exception as e:
             print(f"rembg_remove error: {e}")
             pass
@@ -52,10 +78,10 @@ def get_subject_cutout(pil_img):
         arr_rgba = np.array(cutout_img)
         if arr_rgba.ndim == 3 and arr_rgba.shape[2] == 4:
             alpha = arr_rgba[:, :, 3].copy()
-            # Clean up low-alpha background noise and fringe artifacts
-            alpha[alpha < 18] = 0
-            valid_mask = alpha >= 18
-            alpha[valid_mask] = np.clip((alpha[valid_mask].astype(np.float32) - 18.0) * (255.0 / 237.0), 0, 255).astype(np.uint8)
+            # Aggressively clean up low-alpha background noise and fringe artifacts
+            alpha[alpha < 25] = 0
+            valid_mask = alpha >= 25
+            alpha[valid_mask] = np.clip((alpha[valid_mask].astype(np.float32) - 25.0) * (255.0 / 230.0), 0, 255).astype(np.uint8)
             arr_rgba[:, :, 3] = alpha
             return Image.fromarray(arr_rgba, mode="RGBA")
 
@@ -137,9 +163,15 @@ def get_subject_cutout(pil_img):
 
 def _create_dynamic_backdrop(width, height, target_rgb, center_x=None, center_y=None):
     """
-    Generate a dynamic studio backdrop with soft radial key lighting aligned with the subject.
+    Generate a studio backdrop. For pure white target (#ffffff), returns solid pure 255 white
+    without any vignette darkening at the borders to meet strict biometric passport standard.
     """
     R, G, B = target_rgb
+    if R >= 240 and G >= 240 and B >= 240:
+        # High-Key Biometric Studio Pure White (#FFFFFF) — 100% uniform solid white
+        bg = np.full((height, width, 3), 255.0, dtype=np.float32)
+        return bg
+
     cx = center_x if center_x is not None else width * 0.5
     cy = center_y if center_y is not None else height * 0.38
 
@@ -147,12 +179,8 @@ def _create_dynamic_backdrop(width, height, target_rgb, center_x=None, center_y=
     diag = np.sqrt(width**2 + height**2)
     dist = np.sqrt((X - cx)**2 + (Y - cy)**2) / max(1.0, diag)
 
-    if R > 245 and G > 245 and B > 245:
-        # High-Key Biometric Studio White
-        lum = 1.0 - 0.035 * (dist ** 1.2)
-    else:
-        # Dynamic Studio Key Light Spotlight (+12% center hotspot, -12% perimeter)
-        lum = 1.12 - 0.24 * (dist ** 1.2)
+    # Dynamic Studio Key Light Spotlight (+12% center hotspot, -12% perimeter)
+    lum = 1.12 - 0.24 * (dist ** 1.2)
 
     bg = np.zeros((height, width, 3), dtype=np.float32)
     bg[:, :, 0] = np.clip(R * lum, 0, 255)
@@ -180,6 +208,7 @@ def replace_background_color(pil_img, hex_color):
     except ValueError:
         return pil_img
 
+    pil_img = ImageOps.exif_transpose(pil_img)
     cutout_rgba = get_subject_cutout(pil_img)
     cutout_arr = np.array(cutout_rgba)
     if cutout_arr.ndim != 3 or cutout_arr.shape[2] != 4:
@@ -206,12 +235,22 @@ def replace_background_color(pil_img, hex_color):
 
     fg_rgb = cutout_arr[:, :, :3].astype(np.float32)
 
+    is_white_bg = (target_rgb[0] >= 240 and target_rgb[1] >= 240 and target_rgb[2] >= 240)
+    if is_white_bg:
+        # Eliminate low-confidence background noise
+        alpha[alpha < 0.10] = 0.0
+
     # Dynamic Light Wrap / Edge Harmonization on boundary transition zone
-    fringe = (alpha > 0.05) & (alpha < 0.85)
+    fringe = (alpha > 0.02) & (alpha < 0.92)
     if np.any(fringe):
-        wrap_factor = (1.0 - alpha[fringe]) * 0.18
-        for c in range(3):
-            fg_rgb[fringe, c] = fg_rgb[fringe, c] * (1.0 - wrap_factor) + bg_layer[fringe, c] * wrap_factor
+        if is_white_bg:
+            # Defringe transition edge so dark background remnants don't leave dark halos
+            for c in range(3):
+                fg_rgb[fringe, c] = np.maximum(fg_rgb[fringe, c], bg_layer[fringe, c] * (1.0 - alpha[fringe]))
+        else:
+            wrap_factor = (1.0 - alpha[fringe]) * 0.18
+            for c in range(3):
+                fg_rgb[fringe, c] = fg_rgb[fringe, c] * (1.0 - wrap_factor) + bg_layer[fringe, c] * wrap_factor
 
     # Alpha composite
     comp = fg_rgb * alpha[:, :, np.newaxis] + bg_layer * (1.0 - alpha[:, :, np.newaxis])

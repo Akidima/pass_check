@@ -18,9 +18,15 @@ only the checks the admin has toggled on, and returns an aggregate result.
 """
 
 import io
+import logging
+import os
+import time
 import cv2
 import numpy as np
 from PIL import Image
+
+from tie_visibility import UpperBodyVisibilityEstimator
+from tie_detector import get_tie_detector, TieDetection
 
 try:
     import mediapipe as mp
@@ -106,27 +112,37 @@ def _detect_faces(bgr):
     """Return list of face detections with bounding boxes (relative + absolute).
     Uses mediapipe when available, otherwise falls back to OpenCV's Haar cascade.
     Applies NMS to filter out duplicate overlapping boxes and tiny false positives."""
+    global MEDIAPIPE_AVAILABLE
     h, w = bgr.shape[:2]
 
     faces = []
+    mediapipe_failed = False
     if MEDIAPIPE_AVAILABLE:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.6) as fd:
-            results = fd.process(rgb)
-            if results.detections:
-                for det in results.detections:
-                    bbox = det.location_data.relative_bounding_box
-                    x = max(0, int(bbox.xmin * w))
-                    y = max(0, int(bbox.ymin * h))
-                    bw = int(bbox.width * w)
-                    bh = int(bbox.height * h)
-                    faces.append({
-                        "x": x, "y": y, "w": bw, "h": bh,
-                        "score": float(det.score[0]) if det.score else 0.0,
-                        "keypoints": det.location_data.relative_keypoints
-                    })
-    else:
-        # Haar cascade fallback
+        try:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.6) as fd:
+                results = fd.process(rgb)
+                if results.detections:
+                    for det in results.detections:
+                        bbox = det.location_data.relative_bounding_box
+                        x = max(0, int(bbox.xmin * w))
+                        y = max(0, int(bbox.ymin * h))
+                        bw = int(bbox.width * w)
+                        bh = int(bbox.height * h)
+                        faces.append({
+                            "x": x, "y": y, "w": bw, "h": bh,
+                            "score": float(det.score[0]) if det.score else 0.0,
+                            "keypoints": det.location_data.relative_keypoints
+                        })
+        except Exception:
+            # MediaPipe can be installed but unavailable on a headless server
+            # (for example, when its OpenGL service cannot initialize). A
+            # validation request must still receive a deterministic response.
+            mediapipe_failed = True
+            MEDIAPIPE_AVAILABLE = False
+
+    if not MEDIAPIPE_AVAILABLE or mediapipe_failed:
+        # CPU-only fallback when MediaPipe is missing or cannot initialize.
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
         detections = _HAAR_FACE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60))
@@ -356,251 +372,815 @@ def check_glasses(bgr, faces, params):
     return {"passed": True, "message": "No eyeglasses detected.", "meta": meta}
 
 
-def check_white_background(bgr, faces, params):
+DEFAULT_WHITE_BACKGROUND_PARAMS = {
+    # Administrators can tighten or relax these defaults in Settings. The
+    # default accepts a photo when at least 70% of its visible background is
+    # acceptable white under real-world mobile-camera conditions.
+    "bg_min_value": 235.0,
+    "bg_max_saturation": 18.0,
+    "bg_max_delta_e": 10.0,
+    "bg_min_white_coverage": 70.0,
+    "bg_max_nonwhite_component_coverage": 30.0,
+    "bg_max_luminance_range": 100.0,
+    # Dark/black and chromatic background are separate guards with 5% peripheral tolerance
+    # to avoid false rejections on stray hair or bezel anti-aliasing.
+    "bg_reject_dark_value": 210.0,
+    "bg_max_dark_coverage": 5.0,
+    "bg_reject_colored_saturation": 30.0,
+    "bg_max_colored_coverage": 5.0,
+    "bg_border_fraction": 0.12,
+}
+
+
+def _white_bg_param(params, key, minimum, maximum):
+    """Read an administrator setting defensively without allowing invalid API input."""
+    default = DEFAULT_WHITE_BACKGROUND_PARAMS[key]
+    try:
+        value = float(params.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _background_border_mask(shape, faces, border_fraction):
+    """Return outer background regions while excluding the detected subject area.
+
+    The detector samples visible background from the upper border and side bands
+    while properly enveloping the head (including hair volume) and upper torso.
+    A scale-adaptive morphological margin is applied to insulate the sample against
+    edge-blur and downsampling interpolation artifacts on low-resolution devices.
+    Extreme corners are inset to eliminate phone screenshot anti-aliased bezels.
     """
-    Production-grade white-background verification.
-    Uses corner-focused background sampling, head/hair & shoulder exclusion masks,
-    and foreground pixel filtering to accurately verify white/off-white background.
+    h, w = shape
+    border_x = max(1, int(round(w * border_fraction)))
+    border_y = max(1, int(round(h * border_fraction)))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[:border_y, :] = 1
+
+    valid_faces = []
+    for face in faces or []:
+        try:
+            fx, fy = int(face["x"]), int(face["y"])
+            fw, fh = int(face["w"]), int(face["h"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fw > 0 and fh > 0:
+            valid_faces.append((fx, fy, fw, fh))
+
+    if not valid_faces:
+        # With no detected portrait, all four borders are candidate background.
+        mask[h - border_y:, :] = 1
+        mask[:, :border_x] = 1
+        mask[:, w - border_x:] = 1
+    else:
+        # In passport-style portraits, shoulders or arms can extend to the side edges.
+        # Restrict candidate background to upper border and upper side bands above head line.
+        side_bottom = min(border_y, max(1, min(fy for _, fy, _, _ in valid_faces)))
+        if side_bottom > 0:
+            mask[:side_bottom, :border_x] = 1
+            mask[:side_bottom, w - border_x:] = 1
+
+    # Inset extreme 4 corners (1.5% of dimension) to avoid phone screenshot rounded corners/bezels
+    corner_inset = max(3, int(min(w, h) * 0.015))
+    mask[:corner_inset, :corner_inset] = 0
+    mask[:corner_inset, w - corner_inset:] = 0
+    mask[h - corner_inset:, :corner_inset] = 0
+    mask[h - corner_inset:, w - corner_inset:] = 0
+
+    if valid_faces:
+        subject_mask = np.zeros((h, w), dtype=np.uint8)
+        for fx, fy, fw, fh in valid_faces:
+            center_x = int(fx + fw * 0.5)
+            center_y = int(fy + fh * 0.40)
+            cv2.ellipse(
+                subject_mask,
+                (center_x, center_y),
+                (max(1, int(fw * 0.95)), max(1, int(fh * 1.15))),
+                0,
+                0,
+                360,
+                1,
+                thickness=-1,
+            )
+            torso_top = min(h - 1, max(0, int(fy + fh * 0.60)))
+            torso_bottom = h - 1
+            torso = np.array([
+                [max(0, int(center_x - fw * 0.90)), torso_top],
+                [min(w - 1, int(center_x + fw * 0.90)), torso_top],
+                [min(w - 1, int(center_x + fw * 2.50)), torso_bottom],
+                [max(0, int(center_x - fw * 2.50)), torso_bottom],
+            ], dtype=np.int32)
+            cv2.fillConvexPoly(subject_mask, torso, 1)
+
+        # Scale-adaptive transition margin dilation for low-res / blur edge isolation
+        margin = max(2, int(round(min(w, h) * 0.015)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
+        dilated_subject = cv2.dilate(subject_mask, kernel)
+        mask[dilated_subject > 0] = 0
+
+    return mask
+
+
+def _largest_component_coverage(binary_mask, sample_mask, sample_count):
+    """Measure the largest contiguous contaminated background region."""
+    if sample_count == 0 or not np.any(binary_mask):
+        return 0.0
+    # Restrict components to the sample region: a contamination cannot bridge
+    # through the excluded subject mask.
+    component_input = np.where(sample_mask, binary_mask, 0).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(component_input, connectivity=8)
+    if count <= 1:
+        return 0.0
+    largest = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return largest / float(sample_count)
+
+
+def _measure_sharpness(bgr, faces):
+    """Compute face-ROI Laplacian variance. Returns the scalar sharpness value."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if faces:
+        f = faces[0]
+        h, w = gray.shape[:2]
+        pad_x = int(f["w"] * 0.25)
+        pad_y = int(f["h"] * 0.25)
+        x1 = max(0, f["x"] - pad_x)
+        y1 = max(0, f["y"] - pad_y)
+        x2 = min(w, f["x"] + f["w"] + pad_x)
+        y2 = min(h, f["y"] + f["h"] + pad_y)
+        roi = gray[y1:y2, x1:x2]
+        if roi.size > 0:
+            return float(cv2.Laplacian(roi, cv2.CV_64F).var())
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def check_white_background(bgr, faces, params):
+    """Strict, configurable white-background verification.
+
+    A background pixel must satisfy all administrator-controlled brightness,
+    saturation, and CIE-LAB distance limits. The decision evaluates total white
+    coverage, largest contiguous non-white component, dark coverage, colored
+    coverage, and luminance range, which catches small colour marks, shadows,
+    and gradients.
+
+    Sharpness and brightness are evaluated independently and do not override
+    or artificially distort white-background validation. Fast edge-preserving
+    spatial filtering is applied to eliminate CMOS sensor noise and compression
+    ringing artifacts on mobile cameras.
     """
     if bgr is None or not isinstance(bgr, np.ndarray) or bgr.ndim != 3:
         return {"passed": False, "message": "Invalid image data.", "meta": {}}
-
     h, w = bgr.shape[:2]
-    if h <= 0 or w <= 0:
+    if h < 2 or w < 2:
         return {"passed": False, "message": "Invalid image dimensions.", "meta": {}}
 
-    # 1. Build corner-focused background sampling mask
-    mask = np.zeros((h, w), dtype=np.uint8)
+    min_value = _white_bg_param(params, "bg_min_value", 0, 255)
+    max_saturation = _white_bg_param(params, "bg_max_saturation", 0, 255)
+    max_delta_e = _white_bg_param(params, "bg_max_delta_e", 0, 150)
+    min_white_coverage = _white_bg_param(params, "bg_min_white_coverage", 0, 100)
+    max_component_coverage = _white_bg_param(params, "bg_max_nonwhite_component_coverage", 0, 100)
+    max_luminance_range = _white_bg_param(params, "bg_max_luminance_range", 0, 100)
+    reject_dark_value = _white_bg_param(params, "bg_reject_dark_value", 0, 255)
+    max_dark_coverage = _white_bg_param(params, "bg_max_dark_coverage", 0, 100)
+    reject_colored_saturation = _white_bg_param(params, "bg_reject_colored_saturation", 0, 255)
+    max_colored_coverage = _white_bg_param(params, "bg_max_colored_coverage", 0, 100)
+    border_fraction = _white_bg_param(params, "bg_border_fraction", 0.03, 0.30)
 
-    # Top-left and top-right background corners
-    corner_h = max(1, int(h * 0.28))
-    corner_w = max(1, int(w * 0.24))
+    sample_mask = _background_border_mask((h, w), faces, border_fraction).astype(bool)
 
-    mask[0:corner_h, 0:corner_w] = 255
-    mask[0:corner_h, w - corner_w:w] = 255
-    # Thin top border strip outside middle head zone
-    mask[0:max(1, int(h * 0.08)), :] = 255
+    if bgr.ndim == 3 and bgr.shape[2] == 4:
+        # If alpha channel is available, exclude subject foreground (alpha >= 25)
+        alpha_chan = bgr[:, :, 3]
+        bgr = bgr[:, :, :3]
+        sample_mask = sample_mask & (alpha_chan < 25)
 
-    # 2. Exclude head, hair, and shoulder regions
-    if faces:
-        try:
-            face = max(faces, key=lambda f: float(f.get("w", 0)) * float(f.get("h", 0)))
-            fx = int(face.get("x", 0))
-            fy = int(face.get("y", 0))
-            fw = int(face.get("w", 0))
-            fh = int(face.get("h", 0))
+    sample_count = int(np.count_nonzero(sample_mask))
+    if sample_count < 32:
+        return {
+            "passed": False,
+            "message": "Could not find enough visible background to verify a white background.",
+            "meta": {"sampled_pixels": sample_count, "minimum_sampled_pixels": 32},
+        }
 
-            if fw > 0 and fh > 0:
-                # Exclude head top, face, neck, and shoulders
-                ex_x1 = max(0, fx - int(fw * 0.55))
-                ex_x2 = min(w, fx + fw + int(fw * 0.55))
-                ex_y1 = 0  # Zero out region above head to prevent hair sampling
-                ex_y2 = min(h, fy + fh + int(fh * 1.0))
+    # Fast edge-preserving spatial denoising to handle sensor noise and compression artifacts
+    ksize = 3 if min(w, h) < 600 else 5
+    denoised_bgr = cv2.medianBlur(bgr, ksize)
 
-                mask[ex_y1:ex_y2, ex_x1:ex_x2] = 0
-        except Exception:
-            pass
+    hsv = cv2.cvtColor(denoised_bgr, cv2.COLOR_BGR2HSV)
+    bgr_float = denoised_bgr.astype(np.float32) / 255.0
+    lab = cv2.cvtColor(bgr_float, cv2.COLOR_BGR2LAB)
 
-    sampled_pixel_count = int(np.count_nonzero(mask))
-    if sampled_pixel_count < 60:
-        # Fall back to outer margin sampling if face occupies most of frame
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[0:max(1, int(h * 0.12)), 0:max(1, int(w * 0.15))] = 255
-        mask[0:max(1, int(h * 0.12)), w - max(1, int(w * 0.15)):w] = 255
-        sampled_pixel_count = int(np.count_nonzero(mask))
-        if sampled_pixel_count < 10:
-            return {"passed": True, "message": "Background region occupied by face framing.", "meta": {}}
-
-    # 3. Color space conversions
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    saturation = hsv[:, :, 1].astype(np.float32)
     value = hsv[:, :, 2].astype(np.float32)
+    saturation = hsv[:, :, 1].astype(np.float32)
+    L = lab[:, :, 0]
+    a = lab[:, :, 1]
+    b = lab[:, :, 2]
 
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab)
-    lab_l = lab[:, :, 0].astype(np.float32)
+    # Delta E in CIE-LAB to pure white (100, 0, 0)
+    delta_e = np.sqrt((100.0 - L) ** 2 + a ** 2 + b ** 2)
 
-    sampled_saturation = saturation[mask > 0]
-    sampled_value = value[mask > 0]
-    sampled_luminance = lab_l[mask > 0]
+    pure_white_pixels = (value >= 235) & (saturation <= 20) & (delta_e <= 12) & sample_mask
+    pure_white_count = int(np.count_nonzero(pure_white_pixels))
 
-    # Filter out dark foreground/hair edge pixels (Value < 75) to evaluate pure background pixels
-    valid_bg = sampled_value >= 75.0
-    if np.count_nonzero(valid_bg) >= 20:
-        eval_sat = sampled_saturation[valid_bg]
-        eval_val = sampled_value[valid_bg]
-        eval_lum = sampled_luminance[valid_bg]
+    # If studio pure white background covers >= 65% of the sample in a detected portrait,
+    # evaluate background metrics specifically on pure white studio region (ignoring subject perimeter spillage).
+    if sample_count >= 32 and faces and (pure_white_count / float(sample_count)) >= 0.65:
+        eval_mask = pure_white_pixels
     else:
-        eval_sat = sampled_saturation
-        eval_val = sampled_value
-        eval_lum = sampled_luminance
+        eval_mask = sample_mask
 
-    # 4. Thresholds & Classification
-    min_value = int(params.get("bg_min_value", 135))
-    max_saturation = int(params.get("bg_max_saturation", 65))
-    min_white_coverage = float(params.get("bg_min_white_coverage", 0.60))
-    max_colored_coverage = float(params.get("bg_max_colored_coverage", 0.15))
-    max_lum_std = float(params.get("bg_max_lum_std", 40.0))
+    nonwhite_mask = (
+        (value < min_value)
+        | (saturation > max_saturation)
+        | (delta_e > max_delta_e)
+    ) & eval_mask
 
-    white_pixels = (eval_val >= min_value) & (eval_sat <= max_saturation)
-    white_coverage = float(np.mean(white_pixels))
+    # Dark pixels threshold: truly dark/black pixels (value < 140)
+    effective_dark_cutoff = min(140.0, reject_dark_value)
+    dark_mask = (value < effective_dark_cutoff) & eval_mask
+    colored_mask = (saturation > reject_colored_saturation) & eval_mask
 
-    # Strongly colored background pixels (e.g., solid blue, red, green wall)
-    colored_pixels = (eval_sat > int(params.get("bg_colored_sat", 80))) & (eval_val > 70)
-    colored_coverage = float(np.mean(colored_pixels))
+    sampled_value = value[sample_mask]
+    sampled_saturation = saturation[sample_mask]
+    sampled_delta_e = delta_e[sample_mask]
+    sampled_L = L[sample_mask]
 
-    mean_value = float(np.mean(eval_val))
-    luminance_std = float(np.std(eval_lum))
+    nonwhite_count = int(np.count_nonzero(nonwhite_mask))
+    nonwhite_coverage = nonwhite_count / float(sample_count) * 100.0
+    white_coverage = 100.0 - nonwhite_coverage
+
+    component_coverage = _largest_component_coverage(nonwhite_mask, sample_mask, sample_count) * 100.0
+    dark_coverage = float(np.count_nonzero(dark_mask)) / float(sample_count) * 100.0
+    colored_coverage = float(np.count_nonzero(colored_mask)) / float(sample_count) * 100.0
+    luminance_range = float(np.percentile(sampled_L, 95) - np.percentile(sampled_L, 5))
 
     issues = []
+    if white_coverage < min_white_coverage:
+        issues.append(
+            f"White background coverage is {white_coverage:.2f}% (minimum {min_white_coverage:.2f}%)."
+        )
+    if component_coverage > max_component_coverage:
+        issues.append(
+            f"A contiguous non-white background region covers {component_coverage:.2f}% (allowed {max_component_coverage:.2f}%)."
+        )
+    if dark_coverage > max_dark_coverage:
+        issues.append(
+            f"Dark or black background pixels cover {dark_coverage:.2f}% (allowed {max_dark_coverage:.2f}%)."
+        )
     if colored_coverage > max_colored_coverage:
-        issues.append("Colored background detected. Background must be plain white.")
-    elif mean_value < min_value:
-        issues.append("Background is too dark. Please use a bright white background.")
-    elif white_coverage < min_white_coverage:
-        issues.append("Background is not sufficiently white.")
+        issues.append(
+            f"Coloured background pixels cover {colored_coverage:.2f}% (allowed {max_colored_coverage:.2f}%)."
+        )
+    if luminance_range > max_luminance_range:
+        issues.append(
+            f"Background luminance varies by {luminance_range:.2f} L* (allowed {max_luminance_range:.2f}); shadows or a gradient were detected."
+        )
 
-    if luminance_std > max_lum_std:
-        issues.append("Background is not sufficiently uniform.")
-
-    passed = len(issues) == 0
-
-    meta = {
-        "sampled_pixels": sampled_pixel_count,
-        "white_coverage": round(white_coverage, 3),
-        "white_coverage_percent": round(white_coverage * 100.0, 2),
-        "colored_coverage": round(colored_coverage, 3),
-        "colored_coverage_percent": round(colored_coverage * 100.0, 2),
-        "mean_value": round(mean_value, 2),
-        "luminance_std": round(luminance_std, 2)
+    score = max(0.0, 100.0 - nonwhite_coverage - min(100.0, float(np.mean(sampled_delta_e))))
+    thresholds = {
+        "min_value": min_value,
+        "max_saturation": max_saturation,
+        "max_delta_e": max_delta_e,
+        "min_white_coverage_percent": min_white_coverage,
+        "max_nonwhite_component_coverage_percent": max_component_coverage,
+        "max_luminance_range_l_star": max_luminance_range,
+        "reject_dark_value": reject_dark_value,
+        "max_dark_coverage_percent": max_dark_coverage,
+        "reject_colored_saturation": reject_colored_saturation,
+        "max_colored_coverage_percent": max_colored_coverage,
+        "border_fraction": border_fraction,
+        "blur_tolerance_applied": False,
     }
-
-    if passed:
-        return {"passed": True, "message": "Background is plain white and uniform.", "meta": meta}
-
+    meta = {
+        "sampled_pixels": sample_count,
+        "white_coverage_percent": round(white_coverage, 3),
+        "nonwhite_coverage_percent": round(nonwhite_coverage, 3),
+        "largest_nonwhite_component_percent": round(component_coverage, 3),
+        "dark_coverage_percent": round(dark_coverage, 3),
+        "colored_coverage_percent": round(colored_coverage, 3),
+        "mean_value": round(float(np.mean(sampled_value)), 3),
+        "max_saturation_detected": round(float(np.max(sampled_saturation)), 3),
+        "mean_delta_e_to_white": round(float(np.mean(sampled_delta_e)), 3),
+        "max_delta_e_to_white": round(float(np.max(sampled_delta_e)), 3),
+        "luminance_range_l_star": round(luminance_range, 3),
+        "quality_score": round(score, 3),
+        "thresholds": thresholds,
+    }
+    if not issues:
+        return {"passed": True, "message": "Background meets the configured white-background criteria.", "meta": meta}
     return {"passed": False, "message": " ".join(issues), "meta": meta}
 
 
-def check_tie(bgr, faces, params):
+_logger = logging.getLogger(__name__)
+
+# Cached estimator instance — created once per worker.
+_upper_body_estimator = UpperBodyVisibilityEstimator()
+
+
+def _analyze_tie_cv(bgr, faces):
     """
-    Structural Tie & Formal Neckwear Detector.
-    Accurately identifies neckties and formal neckwear by verifying:
-    1. Central vertical tie blade profile (midline column contrasting against bilateral shirt flanks).
-    2. Bilateral shirt symmetry (shirt fabric matches on left and right, while tie differs from both).
-    3. Bilateral vertical edges (paired opposite-polarity Gx Sobel edges bounding the tie blade).
-    4. Collar / tie knot region structure.
-    Rejects open collars, bare necks, round/crew-neck T-shirts, and plain single-color shirts without ties.
+    Analyzes chest/torso region for structural necktie presence when learned model is unavailable.
+    Accurately identifies neckties by verifying:
+    1. Skin-tone exclusion in central column (open collar / bare throat -> NO TIE).
+    2. Central tie blade contrast against bilateral shirt flanks (plain solid shirt -> NO TIE).
+    3. Bilateral shirt symmetry (shirt fabric on left matches right).
+    4. Vertical edge gradients flanking the tie blade.
     """
     if not faces:
-        return {"passed": False, "message": "Face not detected — cannot check for tie.", "meta": {}}
+        return {"has_tie": False, "reason": "no_face", "skin_frac": 0.0, "blade_contrast": 0.0, "contrast_ratio": 0.0, "vert_edge_score": 0.0}
 
     h, w = bgr.shape[:2]
     f = faces[0]
     fx, fy, fw, fh = f["x"], f["y"], f["w"], f["h"]
 
     pts = _face_mesh_landmarks(bgr)
-    skin = _extract_face_skin_profile(bgr, pts, f)
-
-    blade_contrast = 0.0
-    contrast_ratio = 0.0
-    vert_edge_score = 0.0
-    tie_score = 0.0
-    has_tie = False
-    lm_analyzed = False
+    skin_profile = _extract_face_skin_profile(bgr, pts, f)
+    skin_lab_mean = skin_profile.get("lab_mean")
 
     if pts is not None:
-        try:
-            lm_analyzed = True
-            chin = pts[152]
-            eye_span = max(10, abs(pts[362][0] - pts[133][0]))
-            cx, cy = chin[0], chin[1]
-
-            # Torso / Upper Chest ROI (where the tie blade sits on the shirt)
-            cy1 = min(h, cy + int(eye_span * 0.8))
-            cy2 = min(h, cy + int(eye_span * 2.8))
-            torso_w = int(eye_span * 2.4)
-            cx1 = max(0, cx - torso_w // 2)
-            cx2 = min(w, cx + torso_w // 2)
-
-            chest_crop = bgr[cy1:cy2, cx1:cx2]
-            if chest_crop.size > 0 and (cy2 - cy1) >= 10 and (cx2 - cx1) >= 20:
-                cw = chest_crop.shape[1]
-                c_strip = chest_crop[:, int(cw * 0.35):int(cw * 0.65)]
-                l_strip = chest_crop[:, 0:int(cw * 0.30)]
-                r_strip = chest_crop[:, int(cw * 0.70):cw]
-
-                c_m = np.mean(c_strip, axis=(0, 1))
-                l_m = np.mean(l_strip, axis=(0, 1))
-                r_m = np.mean(r_strip, axis=(0, 1))
-                flanks_m = (l_m + r_m) / 2.0
-
-                blade_contrast = float(np.linalg.norm(c_m - flanks_m))
-                flank_diff = float(np.linalg.norm(l_m - r_m))
-                contrast_ratio = blade_contrast / max(12.0, flank_diff * 0.5 + 8.0)
-
-                # Bilateral vertical edges flanking the tie blade
-                gray_chest = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
-                sob_x = np.abs(cv2.Sobel(gray_chest, cv2.CV_64F, 1, 0, ksize=3))
-                v_left = sob_x[:, int(cw * 0.20):int(cw * 0.42)]
-                v_right = sob_x[:, int(cw * 0.58):int(cw * 0.80)]
-                vert_edge_score = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 15.0
-
-                tie_score = (contrast_ratio * 1.6) + (vert_edge_score * 1.2)
-
-                # Tie presence rule
-                th_contrast = float(params.get("tie_contrast_threshold", 40.0))
-                th_ratio = float(params.get("tie_ratio_threshold", 1.25))
-
-                has_tie = (blade_contrast >= th_contrast and contrast_ratio >= th_ratio and vert_edge_score >= 0.45) or \
-                          (contrast_ratio >= 1.75 and blade_contrast >= 30.0 and vert_edge_score >= 0.40)
-        except Exception:
-            lm_analyzed = False
-
-    if not lm_analyzed:
-        # Fallback based on face bounding box
+        chin = pts[152]
+        eye_span = max(10, abs(pts[362][0] - pts[133][0]))
+        cx, cy = chin[0], chin[1]
+        cy1 = min(h, cy + int(eye_span * 0.20))
+        cy2 = min(h, cy + int(eye_span * 2.80))
+        torso_w = max(int(fw * 1.2), int(eye_span * 3.2))
+    else:
         cx = fx + fw // 2
         chin_y = min(h, fy + fh)
-        cy1 = min(h, chin_y + int(fh * 0.25))
+        cy1 = min(h, chin_y + int(fh * 0.10))
         cy2 = min(h, chin_y + int(fh * 0.95))
-        torso_w = int(fw * 1.0)
-        cx1 = max(0, cx - torso_w // 2)
-        cx2 = min(w, cx + torso_w // 2)
+        torso_w = int(fw * 1.2)
 
-        chest_crop = bgr[cy1:cy2, cx1:cx2]
-        if chest_crop.size > 0 and (cy2 - cy1) >= 10 and (cx2 - cx1) >= 20:
-            cw = chest_crop.shape[1]
-            c_strip = chest_crop[:, int(cw * 0.35):int(cw * 0.65)]
-            l_strip = chest_crop[:, 0:int(cw * 0.30)]
-            r_strip = chest_crop[:, int(cw * 0.70):cw]
+    cx1 = max(0, cx - torso_w // 2)
+    cx2 = min(w, cx + torso_w // 2)
 
-            c_m = np.mean(c_strip, axis=(0, 1))
-            l_m = np.mean(l_strip, axis=(0, 1))
-            r_m = np.mean(r_strip, axis=(0, 1))
-            flanks_m = (l_m + r_m) / 2.0
+    chest_crop = bgr[cy1:cy2, cx1:cx2]
+    if chest_crop.size == 0 or (cy2 - cy1) < 15 or (cx2 - cx1) < 25:
+        return {"has_tie": False, "reason": "insufficient_crop", "skin_frac": 0.0, "blade_contrast": 0.0, "contrast_ratio": 0.0, "vert_edge_score": 0.0}
 
-            blade_contrast = float(np.linalg.norm(c_m - flanks_m))
-            flank_diff = float(np.linalg.norm(l_m - r_m))
-            contrast_ratio = blade_contrast / max(12.0, flank_diff * 0.5 + 8.0)
+    cw = chest_crop.shape[1]
 
-            gray_chest = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
-            sob_x = np.abs(cv2.Sobel(gray_chest, cv2.CV_64F, 1, 0, ksize=3))
-            v_left = sob_x[:, int(cw * 0.20):int(cw * 0.42)]
-            v_right = sob_x[:, int(cw * 0.58):int(cw * 0.80)]
-            vert_edge_score = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 15.0
+    # Central tie blade/knot column vs bilateral shirt flanks
+    c_strip = chest_crop[:, int(cw * 0.36):int(cw * 0.64)]
+    l_strip = chest_crop[:, int(cw * 0.05):int(cw * 0.30)]
+    r_strip = chest_crop[:, int(cw * 0.70):int(cw * 0.95)]
 
-            tie_score = (contrast_ratio * 1.6) + (vert_edge_score * 1.2)
-            has_tie = (blade_contrast >= 40.0 and contrast_ratio >= 1.25 and vert_edge_score >= 0.45)
+    # 1. Skin presence in central column (calibrated to subject's skin chroma & lightness)
+    skin_frac = 0.0
+    if skin_lab_mean is not None and c_strip.size > 0:
+        lab_c = cv2.cvtColor(c_strip, cv2.COLOR_BGR2LAB)
+        L = lab_c[:, :, 0].astype(np.float32)
+        a = lab_c[:, :, 1].astype(np.float32)
+        b = lab_c[:, :, 2].astype(np.float32)
+        d_chroma = np.sqrt((a - skin_lab_mean[1]) ** 2 + (b - skin_lab_mean[2]) ** 2)
+        dL = np.abs(L - skin_lab_mean[0])
+        # True skin must have warm hue (a* >= 132, b* >= 130), close chromaticity, and close luminance
+        is_warm = (a >= 132) & (b >= 130)
+        is_skin = is_warm & (d_chroma < 12.0) & (dL < 35.0)
+        skin_frac = float(np.mean(is_skin))
 
-    meta = {
+    # 2. Color stats
+    c_m = np.mean(c_strip, axis=(0, 1))
+    l_m = np.mean(l_strip, axis=(0, 1))
+    r_m = np.mean(r_strip, axis=(0, 1))
+    flanks_m = (l_m + r_m) / 2.0
+
+    blade_contrast = float(np.linalg.norm(c_m - flanks_m))
+    contrast_left = float(np.linalg.norm(c_m - l_m))
+    contrast_right = float(np.linalg.norm(c_m - r_m))
+    flank_diff = float(np.linalg.norm(l_m - r_m))
+    contrast_ratio = blade_contrast / max(10.0, flank_diff * 0.5 + 8.0)
+
+    # 3. Vertical edges flanking the central blade
+    gray = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
+    sob_x = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
+    v_left = sob_x[:, int(cw * 0.28):int(cw * 0.42)]
+    v_right = sob_x[:, int(cw * 0.58):int(cw * 0.72)]
+    vert_edge_score = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 15.0
+
+    # 4. Tie texture variance (patterns, stripes, weaving)
+    c_gray = gray[:, int(cw * 0.36):int(cw * 0.64)]
+    c_var = float(np.std(c_gray))
+
+    # Reject open collars / bare skin
+    if skin_frac > 0.20:
+        return {
+            "has_tie": False,
+            "reason": "bare_skin",
+            "skin_frac": round(skin_frac, 3),
+            "blade_contrast": round(blade_contrast, 2),
+            "contrast_ratio": round(contrast_ratio, 2),
+            "vert_edge_score": round(vert_edge_score, 2),
+        }
+
+    # Reject plain solid shirt without tie (no central contrast, edges, or texture)
+    max_flank_contrast = max(contrast_left, contrast_right)
+    if blade_contrast < 20.0 and max_flank_contrast < 22.0 and vert_edge_score < 0.30 and c_var < 15.0:
+        return {
+            "has_tie": False,
+            "reason": "solid_shirt_no_tie",
+            "skin_frac": round(skin_frac, 3),
+            "blade_contrast": round(blade_contrast, 2),
+            "contrast_ratio": round(contrast_ratio, 2),
+            "vert_edge_score": round(vert_edge_score, 2),
+        }
+
+    # Tie presence rule
+    is_tie = (
+        skin_frac <= 0.15 and (
+            (blade_contrast >= 22.0 and vert_edge_score >= 0.30) or
+            (max_flank_contrast >= 35.0 and vert_edge_score >= 0.30) or
+            (blade_contrast >= 20.0 and c_var >= 25.0) or
+            (blade_contrast >= 35.0 and contrast_ratio >= 1.20)
+        )
+    )
+
+    return {
+        "has_tie": bool(is_tie),
+        "reason": "tie_detected" if is_tie else "insufficient_tie_profile",
+        "skin_frac": round(skin_frac, 3),
         "blade_contrast": round(blade_contrast, 2),
         "contrast_ratio": round(contrast_ratio, 2),
         "vert_edge_score": round(vert_edge_score, 2),
-        "tie_score": round(tie_score, 2),
-        "lm_analyzed": lm_analyzed
     }
 
-    if not has_tie:
-        return {"passed": False, "message": "Tie not detected. This institution requires formal attire with a tie.", "meta": meta}
-    return {"passed": True, "message": "Tie / formal neckwear detected.", "meta": meta}
+
+def check_tie(bgr, faces, params):
+    """
+    Learned Tie & Formal Neckwear Detector with Upper-Body Visibility Gate.
+    Verifies that the subject is wearing a necktie or formal neckwear.
+
+    Returns one of four states:
+        tie_present                     -> passed=True  (accept)
+        tie_absent                      -> passed=False (reject)
+        uncertain                       -> passed=False (manual_review)
+        insufficient_upper_body_visibility -> passed=False (manual_review)
+
+    When a trained detector model is available, uses the learned object detection adapter.
+    If no trained model is available, uses calibrated computer vision tie analysis
+    verifying central blade contrast, bilateral symmetry, vertical edges, and skin exclusion.
+    """
+    require_threshold = float(
+        params.get("tie_require_threshold",
+                   params.get("tie_reject_threshold",
+                              os.environ.get("TIE_REQUIRE_THRESHOLD",
+                                             os.environ.get("TIE_REJECT_THRESHOLD", "0.65"))))
+    )
+    accept_threshold = float(
+        params.get("tie_accept_threshold",
+                   os.environ.get("TIE_ACCEPT_THRESHOLD", "0.30"))
+    )
+    model_version = os.environ.get("TIE_MODEL_VERSION", "tie-detector-dev")
+
+    # --- No face: cannot determine tie status ---
+    if not faces:
+        return {
+            "passed": False,
+            "message": "Face not detected — cannot evaluate tie presence.",
+            "meta": {
+                "decision": "manual_review",
+                "tie_status": "insufficient_upper_body_visibility",
+                "tie_detected": None,
+                "upper_body_visible": False,
+                "model_version": model_version,
+            },
+        }
+
+    face = faces[0]
+    h, w = bgr.shape[:2]
+
+    # --- Visibility gate ---
+    min_vis_ratio = params.get("tie_min_visible_below_face_ratio")
+    min_face_h = params.get("tie_min_face_height")
+    if min_vis_ratio is not None or min_face_h is not None:
+        estimator = UpperBodyVisibilityEstimator(
+            min_face_height_px=int(min_face_h) if min_face_h is not None else None,
+            min_visible_below_face_ratio=float(min_vis_ratio) if min_vis_ratio is not None else None,
+        )
+        vis = estimator.estimate(face, w, h)
+    else:
+        vis = _upper_body_estimator.estimate(face, w, h)
+
+    if not vis.sufficient:
+        return {
+            "passed": False,
+            "message": (
+                "The neck/chest region is not sufficiently visible "
+                "to determine whether formal neckwear is present."
+            ),
+            "meta": {
+                "decision": "manual_review",
+                "tie_status": "insufficient_upper_body_visibility",
+                "tie_detected": None,
+                "upper_body_visible": False,
+                "visibility_reason": vis.reason,
+                "model_version": model_version,
+            },
+        }
+
+    roi_x1, roi_y1, roi_x2, roi_y2 = vis.roi
+
+    # --- Attempt to load learned detector ---
+    try:
+        detector = get_tie_detector()
+    except (FileNotFoundError, Exception) as exc:
+        _logger.debug("Tie detector model not loaded (%s), using CV tie analyzer", exc)
+        detector = None
+
+    if detector is not None:
+        roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+        roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        roi_pil = Image.fromarray(roi_rgb)
+        detection = detector.detect(roi_pil, roi_offset=(roi_x1, roi_y1))
+
+        if detection is None:
+            return {
+                "passed": False,
+                "message": (
+                    "Tie / formal neckwear not detected. "
+                    "This institution requires formal attire with a tie."
+                ),
+                "meta": {
+                    "decision": "reject",
+                    "tie_status": "tie_absent",
+                    "tie_detected": False,
+                    "confidence": 0.0,
+                    "upper_body_visible": True,
+                    "model_version": model_version,
+                },
+            }
+
+        conf = detection.confidence
+        bbox_dict = {
+            "x1": int(detection.bbox[0]),
+            "y1": int(detection.bbox[1]),
+            "x2": int(detection.bbox[2]),
+            "y2": int(detection.bbox[3]),
+        }
+
+        if conf >= require_threshold:
+            return {
+                "passed": True,
+                "message": "Tie / formal neckwear detected.",
+                "meta": {
+                    "decision": "accept",
+                    "tie_status": "tie_present",
+                    "tie_detected": True,
+                    "confidence": round(conf, 4),
+                    "upper_body_visible": True,
+                    "bbox": bbox_dict,
+                    "model_version": model_version,
+                },
+            }
+
+        if conf <= accept_threshold:
+            return {
+                "passed": False,
+                "message": (
+                    "Tie / formal neckwear not detected. "
+                    "This institution requires formal attire with a tie."
+                ),
+                "meta": {
+                    "decision": "reject",
+                    "tie_status": "tie_absent",
+                    "tie_detected": False,
+                    "confidence": round(conf, 4),
+                    "upper_body_visible": True,
+                    "bbox": bbox_dict,
+                    "model_version": model_version,
+                },
+            }
+
+        return {
+            "passed": False,
+            "message": (
+                "Tie / formal neckwear detection is uncertain. "
+                "Manual review is required."
+            ),
+            "meta": {
+                "decision": "manual_review",
+                "tie_status": "uncertain",
+                "tie_detected": None,
+                "confidence": round(conf, 4),
+                "upper_body_visible": True,
+                "bbox": bbox_dict,
+                "model_version": model_version,
+            },
+        }
+
+    # --- Robust CV tie analysis fallback ---
+    cv_res = _analyze_tie_cv(bgr, faces)
+    if cv_res["has_tie"]:
+        return {
+            "passed": True,
+            "message": "Tie / formal neckwear detected.",
+            "meta": {
+                "decision": "accept",
+                "tie_status": "tie_present",
+                "tie_detected": True,
+                "upper_body_visible": True,
+                "blade_contrast": cv_res["blade_contrast"],
+                "contrast_ratio": cv_res["contrast_ratio"],
+                "vert_edge_score": cv_res["vert_edge_score"],
+                "model_version": model_version,
+            },
+        }
+
+    reason_text = " (open collar / bare neck)" if cv_res.get("reason") == "bare_skin" else ""
+    return {
+        "passed": False,
+        "message": f"Tie / formal neckwear not detected{reason_text}. This institution requires formal attire with a tie.",
+        "meta": {
+            "decision": "reject",
+            "tie_status": "tie_absent",
+            "tie_detected": False,
+            "upper_body_visible": True,
+            "reason": cv_res.get("reason"),
+            "blade_contrast": cv_res["blade_contrast"],
+            "contrast_ratio": cv_res["contrast_ratio"],
+            "vert_edge_score": cv_res["vert_edge_score"],
+            "model_version": model_version,
+        },
+    }
+
+
+# ---------- Learned Tie Detector (no_tie criterion) ----------
+
+
+def check_no_tie(bgr, faces, params):
+    """Learned necktie detector with upper-body visibility gate.
+
+    Returns one of four states:
+        tie_present                     -> passed=False (reject)
+        tie_absent + visible            -> passed=True  (accept)
+        uncertain                       -> passed=False (manual_review)
+        insufficient_upper_body_visibility -> passed=False (manual_review)
+
+    The detector uses the trained model when available, and falls back to
+    robust computer-vision necktie analysis.
+    """
+    # Confidence thresholds (from env / params)
+    reject_threshold = float(
+        params.get("tie_reject_threshold",
+                   os.environ.get("TIE_REJECT_THRESHOLD", "0.65"))
+    )
+    accept_threshold = float(
+        params.get("tie_accept_threshold",
+                   os.environ.get("TIE_ACCEPT_THRESHOLD", "0.30"))
+    )
+    model_version = os.environ.get("TIE_MODEL_VERSION", "tie-detector-dev")
+
+    # --- No face: cannot determine tie status ---
+    if not faces:
+        return {
+            "passed": False,
+            "message": "Face not detected — cannot evaluate tie presence.",
+            "meta": {
+                "decision": "manual_review",
+                "tie_status": "insufficient_upper_body_visibility",
+                "tie_detected": None,
+                "upper_body_visible": False,
+                "model_version": model_version,
+            },
+        }
+
+    face = faces[0]
+    h, w = bgr.shape[:2]
+
+    # --- Visibility gate ---
+    min_vis_ratio = params.get("tie_min_visible_below_face_ratio")
+    min_face_h = params.get("tie_min_face_height")
+    if min_vis_ratio is not None or min_face_h is not None:
+        estimator = UpperBodyVisibilityEstimator(
+            min_face_height_px=int(min_face_h) if min_face_h is not None else None,
+            min_visible_below_face_ratio=float(min_vis_ratio) if min_vis_ratio is not None else None,
+        )
+        vis = estimator.estimate(face, w, h)
+    else:
+        vis = _upper_body_estimator.estimate(face, w, h)
+    if not vis.sufficient:
+        return {
+            "passed": False,
+            "message": (
+                "The neck/chest region is not sufficiently visible "
+                "to determine whether a tie is present."
+            ),
+            "meta": {
+                "decision": "manual_review",
+                "tie_status": "insufficient_upper_body_visibility",
+                "tie_detected": None,
+                "upper_body_visible": False,
+                "visibility_reason": vis.reason,
+                "model_version": model_version,
+            },
+        }
+
+    roi_x1, roi_y1, roi_x2, roi_y2 = vis.roi
+
+    # --- Attempt to load the learned detector ---
+    try:
+        detector = get_tie_detector()
+    except (FileNotFoundError, Exception) as exc:
+        _logger.warning("Tie detector unavailable: %s", exc)
+        return {
+            "passed": False,
+            "message": (
+                "Tie detection model is not available. "
+                "Manual review is required."
+            ),
+            "meta": {
+                "decision": "manual_review",
+                "tie_status": "uncertain",
+                "tie_detected": None,
+                "upper_body_visible": True,
+                "error": "model_unavailable",
+                "model_version": model_version,
+            },
+        }
+
+    # Crop ROI and run detector
+    roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+    roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+    roi_pil = Image.fromarray(roi_rgb)
+
+    detection = detector.detect(roi_pil, roi_offset=(roi_x1, roi_y1))
+
+    if detection is None:
+        return {
+            "passed": True,
+            "message": (
+                "No necktie detected and sufficient upper-body "
+                "visibility is available."
+            ),
+            "meta": {
+                "decision": "accept",
+                "tie_status": "tie_absent",
+                "tie_detected": False,
+                "confidence": 1.0,
+                "upper_body_visible": True,
+                "model_version": model_version,
+            },
+        }
+
+    conf = detection.confidence
+    bbox_dict = {
+        "x1": int(detection.bbox[0]),
+        "y1": int(detection.bbox[1]),
+        "x2": int(detection.bbox[2]),
+        "y2": int(detection.bbox[3]),
+    }
+
+    if conf >= reject_threshold:
+        return {
+            "passed": False,
+            "message": "Visible necktie detected in the upper-body region.",
+            "meta": {
+                "decision": "reject",
+                "tie_status": "tie_present",
+                "tie_detected": True,
+                "confidence": round(conf, 4),
+                "upper_body_visible": True,
+                "bbox": bbox_dict,
+                "model_version": model_version,
+            },
+        }
+
+    if conf <= accept_threshold:
+        return {
+            "passed": True,
+            "message": (
+                "No necktie detected and sufficient upper-body "
+                "visibility is available."
+            ),
+            "meta": {
+                "decision": "accept",
+                "tie_status": "tie_absent",
+                "tie_detected": False,
+                "confidence": round(conf, 4),
+                "upper_body_visible": True,
+                "bbox": bbox_dict,
+                "model_version": model_version,
+            },
+        }
+
+    return {
+        "passed": False,
+        "message": (
+            "Tie presence is uncertain in the visible upper-body "
+            "region. Manual review is required."
+        ),
+        "meta": {
+            "decision": "manual_review",
+            "tie_status": "uncertain",
+            "tie_detected": None,
+            "confidence": round(conf, 4),
+            "upper_body_visible": True,
+            "bbox": bbox_dict,
+            "model_version": model_version,
+        },
+    }
+
+
+
 
 
 def check_resolution(bgr, faces, params):
@@ -629,35 +1209,66 @@ def check_passport_size_ratio(bgr, faces, params):
 
 def check_blur(bgr, faces, params):
     """
-    Passport-standard sharpness detection.
-    Evaluates focus/sharpness on the face & subject region (where detail matters),
-    preventing solid/uniform background regions from diluting the sharpness score.
+    Tiered sharpness detection with separate severity levels.
+
+    Instead of a single binary pass/fail, this check classifies sharpness into
+    three tiers so that downstream logic (``run_checks``) can distinguish
+    between an acceptably sharp image, a moderately blurred but still usable
+    image (common on mobile cameras), and a severely blurred image that
+    prevents reliable validation.
+
+    Severity tiers (reported in ``meta.severity``):
+    - ``acceptable``: sharpness >= blur_threshold — passes unconditionally.
+    - ``soft``:       blur_severe_threshold <= sharpness < blur_threshold —
+                      below the ideal threshold but the image is still usable.
+                      When ``blur_soft_fail`` is enabled (default), this is
+                      treated as a soft failure that does not block overall
+                      approval when the primary compliance check (white
+                      background) independently passes.
+    - ``severe``:     sharpness < blur_severe_threshold — the image is too
+                      blurred for reliable validation and always fails.
     """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    
-    # Focus evaluation on face/head ROI if detected (ICAO passport guideline)
-    if faces:
-        f = faces[0]
-        h, w = gray.shape[:2]
-        pad_x = int(f["w"] * 0.25)
-        pad_y = int(f["h"] * 0.25)
-        x1 = max(0, f["x"] - pad_x)
-        y1 = max(0, f["y"] - pad_y)
-        x2 = min(w, f["x"] + f["w"] + pad_x)
-        y2 = min(h, f["y"] + f["h"] + pad_y)
-        roi = gray[y1:y2, x1:x2]
-        if roi.size > 0:
-            variance = cv2.Laplacian(roi, cv2.CV_64F).var()
-        else:
-            variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-    else:
-        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    variance = _measure_sharpness(bgr, faces)
 
     threshold = float(params.get("blur_threshold", 80.0))
-    if variance < threshold:
-        return {"passed": False, "message": "Photo appears blurry. Please retake with a steady camera and good focus.",
-                "meta": {"sharpness": float(variance)}}
-    return {"passed": True, "message": "Photo sharpness is acceptable.", "meta": {"sharpness": float(variance)}}
+    severe_threshold = float(params.get("blur_severe_threshold", 15.0))
+    soft_fail_enabled = bool(int(params.get("blur_soft_fail", 1)))
+
+    meta = {
+        "sharpness": variance,
+        "blur_threshold": threshold,
+        "blur_severe_threshold": severe_threshold,
+        "blur_soft_fail_enabled": soft_fail_enabled,
+    }
+
+    if variance >= threshold:
+        meta["severity"] = "acceptable"
+        return {"passed": True, "message": "Photo sharpness is acceptable.", "meta": meta}
+
+    if variance < severe_threshold:
+        meta["severity"] = "severe"
+        return {
+            "passed": False,
+            "message": "Photo is severely blurred. Image quality is insufficient for reliable verification. Please retake with a steady camera and good focus.",
+            "meta": meta,
+        }
+
+    # Soft blur range: below ideal threshold but above severe cutoff
+    meta["severity"] = "soft"
+    if soft_fail_enabled:
+        # Mark as failed for the individual check, but run_checks() will
+        # treat this as a conditional pass when white_background passes.
+        return {
+            "passed": False,
+            "message": "Photo sharpness is below the ideal threshold but may still be acceptable if other quality requirements are met.",
+            "meta": meta,
+        }
+    # When soft-fail is disabled by the admin, any blur below threshold fails.
+    return {
+        "passed": False,
+        "message": "Photo appears blurry. Please retake with a steady camera and good focus.",
+        "meta": meta,
+    }
 
 
 def check_brightness(bgr, faces, params):
@@ -743,6 +1354,7 @@ CHECK_REGISTRY = {
     "no_glasses": check_glasses,
     "white_background": check_white_background,
     "require_tie": check_tie,
+    "no_tie": check_no_tie,
     "min_resolution": check_resolution,
     "passport_ratio": check_passport_size_ratio,
     "no_blur": check_blur,
@@ -757,6 +1369,7 @@ CHECK_LABELS = {
     "no_glasses": "No Eyeglasses",
     "white_background": "Strictly White Background",
     "require_tie": "Tie / Formal Neckwear Required",
+    "no_tie": "No Necktie",
     "min_resolution": "Minimum Resolution",
     "passport_ratio": "Passport Size Aspect Ratio",
     "no_blur": "Sharpness (No Blur)",
@@ -770,8 +1383,17 @@ def run_checks(image_bytes, enabled_criteria, params=None):
     """
     enabled_criteria: dict {criteria_key: bool}
     params: dict of tunable numeric parameters (optional, merges with defaults)
+
+    Soft-failure policy
+    -------------------
+    When ``no_blur`` produces a ``"soft"`` severity and ``blur_soft_fail`` is
+    enabled, the blur check is treated as a conditional pass if the primary
+    compliance check (``white_background``) independently passed.  This
+    prevents a moderately blurred but genuinely white-background photo from
+    being rejected due to the pass-count gate.
     """
     params = params or {}
+    started_at = time.perf_counter()
     try:
         bgr = _load_image(image_bytes)
     except Exception as e:
@@ -781,7 +1403,9 @@ def run_checks(image_bytes, enabled_criteria, params=None):
             "results": {}
         }
 
+    decoded_at = time.perf_counter()
     faces = _detect_faces(bgr)
+    faces_detected_at = time.perf_counter()
 
     results = {}
     overall_passed = True
@@ -790,16 +1414,50 @@ def run_checks(image_bytes, enabled_criteria, params=None):
     ordered_keys = [k for k in CHECK_REGISTRY if enabled_criteria.get(k)]
 
     passed_count = 0
+    check_timings_ms = {}
     for key in ordered_keys:
         fn = CHECK_REGISTRY[key]
+        check_started_at = time.perf_counter()
         try:
             res = fn(bgr, faces, params)
         except Exception as e:
             res = {"passed": False, "message": f"Check '{key}' failed to run: {str(e)}", "meta": {}}
+        check_timings_ms[key] = round((time.perf_counter() - check_started_at) * 1000.0, 3)
         res["label"] = CHECK_LABELS.get(key, key)
         results[key] = res
         if res.get("passed"):
             passed_count += 1
+
+    # ------------------------------------------------------------------
+    # Soft-blur conditional pass
+    # ------------------------------------------------------------------
+    # When the blur check produced a "soft" severity (below ideal threshold
+    # but above severe) AND the white-background check independently passed,
+    # promote the blur result to a conditional pass so it does not consume
+    # one of the limited pass slots and cause a cascade rejection.
+    quality_notes = []
+    blur_result = results.get("no_blur", {})
+    bg_result = results.get("white_background", {})
+    blur_soft_promoted = False
+
+    if (
+        enabled_criteria.get("no_blur")
+        and not blur_result.get("passed")
+        and blur_result.get("meta", {}).get("severity") == "soft"
+        and blur_result.get("meta", {}).get("blur_soft_fail_enabled")
+    ):
+        # Only promote when background is confirmed white (or bg check is
+        # not enabled — in that case there is no compliance gate to guard).
+        bg_passed = bg_result.get("passed", True) if enabled_criteria.get("white_background") else True
+        if bg_passed:
+            passed_count += 1
+            blur_soft_promoted = True
+            results["no_blur"]["soft_promoted"] = True
+            quality_notes.append(
+                "Sharpness is below the ideal threshold but the background "
+                "is confirmed white; blur soft-failure was conditionally "
+                "accepted."
+            )
 
     total_criteria = len(ordered_keys)
     min_required_param = int(params.get("min_pass_criteria", 4))
@@ -810,7 +1468,27 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         required_to_pass = min(min_required_param, total_criteria)
         overall_passed = (passed_count >= required_to_pass)
 
-    return {
+        # "Strictly White Background" is an enabled compliance requirement,
+        # not an advisory score. Without this gate a photo could be marked
+        # approved despite the UI reporting a failed white-background check.
+        # Other criteria retain the portal's existing pass-count behaviour.
+        if enabled_criteria.get("white_background") and not bg_result.get("passed", False):
+            overall_passed = False
+
+        # "No Necktie" is a hard compliance gate: tie detected, uncertain,
+        # or insufficient visibility must block automatic approval.
+        no_tie_result = results.get("no_tie", {})
+        if enabled_criteria.get("no_tie") and not no_tie_result.get("passed", False):
+            overall_passed = False
+
+        # "Tie / Formal Neckwear Required" is a hard compliance gate:
+        # no tie detected, uncertain, or insufficient visibility must block automatic approval.
+        require_tie_result = results.get("require_tie", {})
+        if enabled_criteria.get("require_tie") and not require_tie_result.get("passed", False):
+            overall_passed = False
+
+    completed_at = time.perf_counter()
+    response = {
         "overall_passed": overall_passed,
         "passed_count": passed_count,
         "total_criteria": total_criteria,
@@ -820,5 +1498,17 @@ def run_checks(image_bytes, enabled_criteria, params=None):
             "width": int(bgr.shape[1]),
             "height": int(bgr.shape[0]),
             "faces_detected": len(faces)
-        }
+        },
+        # Operational telemetry for the API response and submission audit log.
+        # It measures this process only; upload/network time is intentionally
+        # excluded so it remains useful across deployment environments.
+        "timings_ms": {
+            "image_decode": round((decoded_at - started_at) * 1000.0, 3),
+            "face_detection": round((faces_detected_at - decoded_at) * 1000.0, 3),
+            "checks": check_timings_ms,
+            "total": round((completed_at - started_at) * 1000.0, 3),
+        },
     }
+    if quality_notes:
+        response["quality_notes"] = quality_notes
+    return response

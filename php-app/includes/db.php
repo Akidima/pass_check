@@ -79,6 +79,7 @@ function init_schema(PDO $pdo): void {
         ['no_glasses', 'No Eyeglasses', 'Eyeglasses are not permitted in the photo.', 0, 3],
         ['white_background', 'Strictly White Background', 'Background must be plain and white.', 1, 4],
         ['require_tie', 'Tie / Formal Neckwear Required', 'A tie or formal neckwear must be worn.', 0, 5],
+        ['no_tie', 'No Necktie', 'Visible neckties are not permitted in the photo (learned detector).', 0, 12],
         ['min_resolution', 'Minimum Resolution', 'Photo must meet minimum resolution requirements.', 1, 6],
         ['passport_ratio', 'Passport Size Aspect Ratio', 'Photo must match standard passport aspect ratio.', 0, 7],
         ['no_blur', 'Sharpness (No Blur)', 'Photo must be sharp and in focus.', 1, 8],
@@ -102,6 +103,27 @@ function init_schema(PDO $pdo): void {
         'university_name' => 'University Passport Photo Verification System',
         'max_attempts' => '5',
         'min_pass_criteria' => '4',
+        // White-background verification settings. These are forwarded to the
+        // Python CV service for every request and are the administrator's
+        // source of truth (the default requires 70% visible white background).
+        'bg_min_value' => '235',
+        'bg_max_saturation' => '18',
+        'bg_max_delta_e' => '10',
+        'bg_min_white_coverage' => '70',
+        'bg_max_nonwhite_component_coverage' => '30',
+        'bg_max_luminance_range' => '100',
+        'bg_reject_dark_value' => '210',
+        'bg_max_dark_coverage' => '5',
+        'bg_reject_colored_saturation' => '30',
+        'bg_max_colored_coverage' => '5',
+        'bg_border_fraction' => '0.12',
+        // Sharpness / blur quality policy. These control the tiered blur
+        // severity system that prevents moderately blurred but genuinely
+        // white-background photos from being rejected unnecessarily.
+        'blur_threshold' => '80',
+        'blur_severe_threshold' => '15',
+        'blur_soft_fail' => '1',
+        'bg_blur_adaptive_tolerance' => '1',
     ];
     $checkS = $pdo->prepare("SELECT COUNT(*) FROM settings WHERE setting_key = ?");
     $insertS = $pdo->prepare("INSERT INTO settings (setting_key, setting_value) VALUES (?, ?)");
@@ -109,6 +131,28 @@ function init_schema(PDO $pdo): void {
         $checkS->execute([$k]);
         if ((int)$checkS->fetchColumn() === 0) {
             $insertS->execute([$k, $v]);
+        }
+    }
+
+    // Upgrade installations that still have the old generated defaults. Values
+    // explicitly changed by an administrator are left untouched.
+    $legacyDefaults = [
+        'bg_max_nonwhite_component_coverage' => ['0', '30'],
+        'bg_max_luminance_range' => ['3', '100'],
+        'bg_min_value' => ['250', '235'],
+        'bg_max_saturation' => ['6', '18'],
+        'bg_max_delta_e' => ['3', '10'],
+        'bg_reject_dark_value' => ['220', '210'],
+        'bg_max_dark_coverage' => ['0', '5'],
+        'bg_reject_colored_saturation' => ['20', '30'],
+        'bg_max_colored_coverage' => ['0', '5'],
+    ];
+    $readSetting = $pdo->prepare("SELECT setting_value FROM settings WHERE setting_key = ?");
+    $updateSetting = $pdo->prepare("UPDATE settings SET setting_value = ? WHERE setting_key = ?");
+    foreach ($legacyDefaults as $key => [$legacyValue, $replacement]) {
+        $readSetting->execute([$key]);
+        if ($readSetting->fetchColumn() === $legacyValue) {
+            $updateSetting->execute([$replacement, $key]);
         }
     }
 }

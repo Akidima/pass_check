@@ -46,6 +46,53 @@ image analysis and returns structured JSON that PHP consumes and stores.
 | Straight Head Pose | Flags tilted/turned heads via face mesh |
 | Eyes Open | Eye-aspect-ratio check |
 
+## Strict white-background verification
+
+The white-background check is a deterministic OpenCV pipeline. The repository
+does not contain a labelled background dataset, so it does not claim to use a
+trained model or a fabricated confidence metric.
+
+For each image, it samples the complete outer border while excluding a
+conservative region around any detected face and shoulders. Every remaining
+sample must satisfy the administrator-configured limits for RGB brightness, HSV
+saturation, and CIE-LAB distance from pure white. It also rejects excess total
+non-white coverage, a contiguous non-white mark, and luminance variation from
+shadows or gradients. No dark, tinted, or otherwise non-white samples are
+discarded before scoring.
+
+Admin → Settings exposes these limits. The shipped defaults require a minimum
+RGB value of 250, saturation no greater than 6, LAB distance no greater than 3,
+and at least **70% white-background coverage**. A compliance failure for an
+enabled **Strictly White Background** criterion always blocks overall approval,
+even if the separate general pass-count threshold has been met.
+
+The 70% allowance applies only to neutral near-white variation. By default,
+any visible dark/black background or chromatic coloured background is rejected;
+both guards have separate administrator settings and default to 0% permitted
+coverage.
+
+Each result stores the sampled-pixel count, white/non-white coverage, largest
+contamination component, LAB distance, luminance range, deterministic quality
+score, and thresholds used in `results.white_background.meta`.
+
+Run the focused regression tests with:
+
+```bash
+python-service/venv/bin/python -m unittest discover -s python-service/tests -v
+```
+
+For a reproducible local CPU-only timing run (without face detection or HTTP
+upload time), use:
+
+```bash
+python-service/venv/bin/python python-service/benchmarks/benchmark_white_background.py
+```
+
+The `/verify` JSON response also includes `timings_ms` for image decode, face
+detection, every enabled check, and total service-side processing. The optional
+U2-Net/rembg model is initialized lazily and cached only for `/edit-photo`, so
+it does not delay photo validation.
+
 ## Setup & Run (Local / XAMPP-style)
 
 ### 1. Python verification service

@@ -277,6 +277,7 @@ img { max-width: 100%; display: block; }
   display: flex;
   align-items: center;
   justify-content: center;
+  border: 2px solid var(--navy-600);
 }
 
 .camera-wrap video, .camera-wrap canvas, .camera-wrap img.captured {
@@ -593,8 +594,12 @@ tbody tr:hover { background: rgba(255,255,255,0.02); }
 .preview-thumb {
   width: 100%;
   border-radius: var(--radius-md);
-  border: 1px solid rgba(255,255,255,0.1);
+  border: 2px solid var(--navy-600);
   margin-top: 16px;
+  background:
+    repeating-conic-gradient(rgba(255,255,255,0.06) 0% 25%, transparent 0% 50%) 0 0 / 16px 16px,
+    var(--navy-900);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.3);
 }
 
 .hidden { display: none !important; }
