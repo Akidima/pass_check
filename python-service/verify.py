@@ -26,7 +26,12 @@ import numpy as np
 from PIL import Image
 
 from tie_visibility import UpperBodyVisibilityEstimator
-from tie_detector import get_tie_detector, TieDetection
+from tie_detector import (
+    TieDetection,
+    TieModelPolicy,
+    get_tie_detector,
+    validate_tie_detection,
+)
 
 try:
     import mediapipe as mp
@@ -374,12 +379,12 @@ def check_glasses(bgr, faces, params):
 
 DEFAULT_WHITE_BACKGROUND_PARAMS = {
     # Administrators can tighten or relax these defaults in Settings. The
-    # default accepts a photo when at least 70% of its visible background is
+    # default accepts a photo when at least 30% of its visible background is
     # acceptable white under real-world mobile-camera conditions.
     "bg_min_value": 235.0,
     "bg_max_saturation": 18.0,
     "bg_max_delta_e": 10.0,
-    "bg_min_white_coverage": 70.0,
+    "bg_min_white_coverage": 30.0,
     "bg_max_nonwhite_component_coverage": 30.0,
     "bg_max_luminance_range": 100.0,
     # Dark/black and chromatic background are separate guards with 5% peripheral tolerance
@@ -675,6 +680,75 @@ _logger = logging.getLogger(__name__)
 # Cached estimator instance — created once per worker.
 _upper_body_estimator = UpperBodyVisibilityEstimator()
 
+# Used only by tests and explicitly injected detector adapters.  Real
+# TorchTieDetector instances receive the equivalent values from the immutable,
+# calibrated model policy loaded in get_tie_detector().
+_TEST_TIE_GEOMETRY = {
+    "min_width_face_ratio": 0.04,
+    "max_width_face_ratio": 0.85,
+    "min_height_face_ratio": 0.12,
+    "max_height_face_ratio": 1.60,
+    "min_top_offset_face_ratio": -0.30,
+    "max_top_offset_face_ratio": 1.35,
+    "max_center_offset_face_ratio": 0.35,
+}
+
+
+def _tie_positive_policy(detector, params):
+    """Return the calibrated positive decision rule for a detector.
+
+    A loaded TorchTieDetector must have a TieModelPolicy.  The fallback keeps
+    the lightweight fake-detector unit tests backwards compatible; it is not
+    reachable by a model loaded through get_tie_detector().
+    """
+    policy = getattr(detector, "policy", None)
+    if isinstance(policy, TieModelPolicy):
+        return policy.positive_threshold, policy.geometry, policy.model_version
+    coco_threshold = getattr(detector, "positive_threshold", None)
+    coco_geometry = getattr(detector, "geometry", None)
+    if isinstance(coco_threshold, (int, float)) and isinstance(coco_geometry, dict):
+        return float(coco_threshold), coco_geometry, detector.version
+    return (
+        float(params.get("tie_require_threshold", params.get("tie_reject_threshold", 0.65))),
+        _TEST_TIE_GEOMETRY,
+        os.environ.get("TIE_MODEL_VERSION", "tie-detector-dev"),
+    )
+
+
+def _tie_manual_review(message, *, status, visible, model_version, **meta):
+    return {
+        "passed": False,
+        "message": message,
+        "meta": {
+            "decision": "manual_review",
+            "tie_status": status,
+            "tie_detected": None,
+            "upper_body_visible": visible,
+            "model_version": model_version,
+            **meta,
+        },
+    }
+
+
+def _tie_absent_result(model_version, *, reason, confidence=0.0, bbox=None):
+    """Return a required-tie failure after a validated negative decision."""
+    meta = {
+        "decision": "reject",
+        "tie_status": "tie_absent",
+        "tie_detected": False,
+        "confidence": round(confidence, 4),
+        "upper_body_visible": True,
+        "reason": reason,
+        "model_version": model_version,
+    }
+    if bbox is not None:
+        meta["bbox"] = bbox
+    return {
+        "passed": False,
+        "message": "Traditional necktie not detected in the visible neck/chest region.",
+        "meta": meta,
+    }
+
 
 def _analyze_tie_cv(bgr, faces):
     """
@@ -684,9 +758,12 @@ def _analyze_tie_cv(bgr, faces):
     2. Central tie blade contrast against bilateral shirt flanks (plain solid shirt -> NO TIE).
     3. Bilateral shirt symmetry (shirt fabric on left matches right).
     4. Vertical edge gradients flanking the tie blade.
+    5. Diverging-edge rejection (V-necklines are NOT ties).
     """
+    _default_result = {"has_tie": False, "skin_frac": 0.0, "blade_contrast": 0.0, "contrast_ratio": 0.0, "vert_edge_score": 0.0}
+
     if not faces:
-        return {"has_tie": False, "reason": "no_face", "skin_frac": 0.0, "blade_contrast": 0.0, "contrast_ratio": 0.0, "vert_edge_score": 0.0}
+        return {**_default_result, "reason": "no_face"}
 
     h, w = bgr.shape[:2]
     f = faces[0]
@@ -715,7 +792,7 @@ def _analyze_tie_cv(bgr, faces):
 
     chest_crop = bgr[cy1:cy2, cx1:cx2]
     if chest_crop.size == 0 or (cy2 - cy1) < 15 or (cx2 - cx1) < 25:
-        return {"has_tie": False, "reason": "insufficient_crop", "skin_frac": 0.0, "blade_contrast": 0.0, "contrast_ratio": 0.0, "vert_edge_score": 0.0}
+        return {**_default_result, "reason": "insufficient_crop"}
 
     cw = chest_crop.shape[1]
 
@@ -724,19 +801,16 @@ def _analyze_tie_cv(bgr, faces):
     l_strip = chest_crop[:, int(cw * 0.05):int(cw * 0.30)]
     r_strip = chest_crop[:, int(cw * 0.70):int(cw * 0.95)]
 
-    # 1. Skin presence in central column (calibrated to subject's skin chroma & lightness)
+    # 1. Skin presence in central column — subject-relative perceptual distance
+    #    (replaces the hard-coded a*>=132, b*>=130 warm-hue gate that only
+    #    worked for a narrow range of skin tones)
     skin_frac = 0.0
     if skin_lab_mean is not None and c_strip.size > 0:
-        lab_c = cv2.cvtColor(c_strip, cv2.COLOR_BGR2LAB)
-        L = lab_c[:, :, 0].astype(np.float32)
-        a = lab_c[:, :, 1].astype(np.float32)
-        b = lab_c[:, :, 2].astype(np.float32)
-        d_chroma = np.sqrt((a - skin_lab_mean[1]) ** 2 + (b - skin_lab_mean[2]) ** 2)
-        dL = np.abs(L - skin_lab_mean[0])
-        # True skin must have warm hue (a* >= 132, b* >= 130), close chromaticity, and close luminance
-        is_warm = (a >= 132) & (b >= 130)
-        is_skin = is_warm & (d_chroma < 12.0) & (dL < 35.0)
-        skin_frac = float(np.mean(is_skin))
+        skin_dists = _compute_skin_distance(c_strip, skin_lab_mean)
+        if skin_dists.size > 0:
+            # Pixels within perceptual distance 12 of calibrated skin are skin
+            is_skin = skin_dists < 12.0
+            skin_frac = float(np.mean(is_skin))
 
     # 2. Color stats
     c_m = np.mean(c_strip, axis=(0, 1))
@@ -761,243 +835,168 @@ def _analyze_tie_cv(bgr, faces):
     c_gray = gray[:, int(cw * 0.36):int(cw * 0.64)]
     c_var = float(np.std(c_gray))
 
-    # Reject open collars / bare skin
-    if skin_frac > 0.20:
-        return {
-            "has_tie": False,
-            "reason": "bare_skin",
-            "skin_frac": round(skin_frac, 3),
-            "blade_contrast": round(blade_contrast, 2),
-            "contrast_ratio": round(contrast_ratio, 2),
-            "vert_edge_score": round(vert_edge_score, 2),
-        }
+    # 5. Diverging-edge detection: a V-neckline has edges that diverge downward
+    #    (wider at the bottom), while tie blade edges are roughly parallel.
+    ch = chest_crop.shape[0]
+    diverging_edges = False
+    if ch > 20 and cw > 20:
+        upper_third = sob_x[:ch // 3, :]
+        lower_third = sob_x[2 * ch // 3:, :]
 
-    # Reject plain solid shirt without tie (no central contrast, edges, or texture)
-    max_flank_contrast = max(contrast_left, contrast_right)
-    if blade_contrast < 20.0 and max_flank_contrast < 22.0 and vert_edge_score < 0.30 and c_var < 15.0:
-        return {
-            "has_tie": False,
-            "reason": "solid_shirt_no_tie",
-            "skin_frac": round(skin_frac, 3),
-            "blade_contrast": round(blade_contrast, 2),
-            "contrast_ratio": round(contrast_ratio, 2),
-            "vert_edge_score": round(vert_edge_score, 2),
-        }
+        # Measure horizontal spread of edge energy in upper vs lower thirds
+        def _edge_spread(region):
+            col_energy = np.mean(region, axis=0)
+            if col_energy.sum() < 1e-6:
+                return 0.0
+            positions = np.arange(len(col_energy), dtype=np.float32)
+            weighted_mean = np.average(positions, weights=col_energy + 1e-9)
+            return float(np.sqrt(np.average((positions - weighted_mean) ** 2, weights=col_energy + 1e-9)))
 
-    # Tie presence rule
-    is_tie = (
-        skin_frac <= 0.15 and (
-            (blade_contrast >= 22.0 and vert_edge_score >= 0.30) or
-            (max_flank_contrast >= 35.0 and vert_edge_score >= 0.30) or
-            (blade_contrast >= 20.0 and c_var >= 25.0) or
-            (blade_contrast >= 35.0 and contrast_ratio >= 1.20)
-        )
-    )
+        upper_spread = _edge_spread(upper_third)
+        lower_spread = _edge_spread(lower_third)
+        # If lower edges are significantly wider-spread than upper, it's a V-neckline
+        if lower_spread > upper_spread * 1.4 and lower_spread > 8.0:
+            diverging_edges = True
 
-    return {
-        "has_tie": bool(is_tie),
-        "reason": "tie_detected" if is_tie else "insufficient_tie_profile",
+    # Build result dict
+    result_meta = {
         "skin_frac": round(skin_frac, 3),
         "blade_contrast": round(blade_contrast, 2),
         "contrast_ratio": round(contrast_ratio, 2),
         "vert_edge_score": round(vert_edge_score, 2),
     }
 
+    # Reject open collars / bare skin
+    if skin_frac > 0.18:
+        return {**result_meta, "has_tie": False, "reason": "bare_skin"}
+
+    # Reject plain solid shirt without tie (no central contrast, edges, or texture)
+    max_flank_contrast = max(contrast_left, contrast_right)
+    if blade_contrast < 20.0 and max_flank_contrast < 22.0 and vert_edge_score < 0.30 and c_var < 15.0:
+        return {**result_meta, "has_tie": False, "reason": "solid_shirt_no_tie"}
+
+    # Reject diverging-edge patterns (V-necklines, open collars with contrast)
+    if diverging_edges and blade_contrast < 40.0:
+        return {**result_meta, "has_tie": False, "reason": "v_neckline"}
+
+    # Tie presence rule
+    is_tie = (
+        skin_frac <= 0.15
+        and not diverging_edges
+        and (
+            (blade_contrast >= 22.0 and vert_edge_score >= 0.30) or
+            (max_flank_contrast >= 35.0 and vert_edge_score >= 0.30) or
+            (blade_contrast >= 20.0 and c_var >= 25.0) or
+            (blade_contrast >= 35.0 and contrast_ratio >= 1.10)
+        )
+    )
+
+    return {
+        **result_meta,
+        "has_tie": bool(is_tie),
+        "reason": "tie_detected" if is_tie else "insufficient_tie_profile",
+    }
+
 
 def check_tie(bgr, faces, params):
-    """
-    Learned Tie & Formal Neckwear Detector with Upper-Body Visibility Gate.
-    Verifies that the subject is wearing a necktie or formal neckwear.
+    """Verify a required tie using calibrated positive evidence only.
 
-    Returns one of four states:
-        tie_present                     -> passed=True  (accept)
-        tie_absent                      -> passed=False (reject)
-        uncertain                       -> passed=False (manual_review)
-        insufficient_upper_body_visibility -> passed=False (manual_review)
-
-    When a trained detector model is available, uses the learned object detection adapter.
-    If no trained model is available, uses calibrated computer vision tie analysis
-    verifying central blade contrast, bilateral symmetry, vertical edges, and skin exclusion.
+    A one-class object detector can establish *presence* but cannot establish
+    *absence*: a missing box could be an open collar, a crop, occlusion, or a
+    model miss.  Therefore only a policy-calibrated, face-relative detection
+    is auto-accepted.  All other cases are explicitly triaged for review,
+    rather than being mislabelled as a no-tie rejection.
     """
-    require_threshold = float(
-        params.get("tie_require_threshold",
-                   params.get("tie_reject_threshold",
-                              os.environ.get("TIE_REQUIRE_THRESHOLD",
-                                             os.environ.get("TIE_REJECT_THRESHOLD", "0.65"))))
-    )
-    accept_threshold = float(
-        params.get("tie_accept_threshold",
-                   os.environ.get("TIE_ACCEPT_THRESHOLD", "0.30"))
-    )
     model_version = os.environ.get("TIE_MODEL_VERSION", "tie-detector-dev")
-
-    # --- No face: cannot determine tie status ---
     if not faces:
-        return {
-            "passed": False,
-            "message": "Face not detected — cannot evaluate tie presence.",
-            "meta": {
-                "decision": "manual_review",
-                "tie_status": "insufficient_upper_body_visibility",
-                "tie_detected": None,
-                "upper_body_visible": False,
-                "model_version": model_version,
-            },
-        }
+        return _tie_manual_review(
+            "Face not detected — cannot evaluate tie presence.",
+            status="insufficient_upper_body_visibility", visible=False,
+            model_version=model_version,
+        )
 
     face = faces[0]
     h, w = bgr.shape[:2]
-
-    # --- Visibility gate ---
     min_vis_ratio = params.get("tie_min_visible_below_face_ratio")
     min_face_h = params.get("tie_min_face_height")
-    if min_vis_ratio is not None or min_face_h is not None:
-        estimator = UpperBodyVisibilityEstimator(
+    estimator = (
+        UpperBodyVisibilityEstimator(
             min_face_height_px=int(min_face_h) if min_face_h is not None else None,
             min_visible_below_face_ratio=float(min_vis_ratio) if min_vis_ratio is not None else None,
         )
-        vis = estimator.estimate(face, w, h)
-    else:
-        vis = _upper_body_estimator.estimate(face, w, h)
-
+        if min_vis_ratio is not None or min_face_h is not None else _upper_body_estimator
+    )
+    vis = estimator.estimate(face, w, h)
     if not vis.sufficient:
-        return {
-            "passed": False,
-            "message": (
-                "The neck/chest region is not sufficiently visible "
-                "to determine whether formal neckwear is present."
-            ),
-            "meta": {
-                "decision": "manual_review",
-                "tie_status": "insufficient_upper_body_visibility",
-                "tie_detected": None,
-                "upper_body_visible": False,
-                "visibility_reason": vis.reason,
-                "model_version": model_version,
-            },
-        }
+        return _tie_manual_review(
+            "The neck/chest region is not sufficiently visible to determine whether formal neckwear is present.",
+            status="insufficient_upper_body_visibility", visible=False,
+            model_version=model_version, visibility_reason=vis.reason,
+        )
 
-    roi_x1, roi_y1, roi_x2, roi_y2 = vis.roi
-
-    # --- Attempt to load learned detector ---
     try:
         detector = get_tie_detector()
-    except (FileNotFoundError, Exception) as exc:
-        _logger.debug("Tie detector model not loaded (%s), using CV tie analyzer", exc)
-        detector = None
+    except Exception as exc:
+        _logger.warning("Tie detector unavailable: %s", exc)
+        return _tie_manual_review(
+            "Tie detection is temporarily unavailable. Manual review is required.",
+            status="uncertain", visible=True, model_version=model_version,
+            error="model_unavailable",
+        )
 
-    if detector is not None:
-        roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
-        roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-        roi_pil = Image.fromarray(roi_rgb)
-        detection = detector.detect(roi_pil, roi_offset=(roi_x1, roi_y1))
+    roi_x1, roi_y1, roi_x2, roi_y2 = vis.roi
+    roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+    detection = detector.detect(
+        Image.fromarray(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)),
+        roi_offset=(roi_x1, roi_y1),
+    )
+    threshold, geometry, model_version = _tie_positive_policy(detector, params)
 
-        if detection is None:
-            return {
-                "passed": False,
-                "message": (
-                    "Tie / formal neckwear not detected. "
-                    "This institution requires formal attire with a tie."
-                ),
-                "meta": {
-                    "decision": "reject",
-                    "tie_status": "tie_absent",
-                    "tie_detected": False,
-                    "confidence": 0.0,
-                    "upper_body_visible": True,
-                    "model_version": model_version,
-                },
-            }
+    if detection is None:
+        if getattr(detector, "supports_absence_decision", False) is True:
+            return _tie_absent_result(model_version, reason="no_valid_detection")
+        return _tie_manual_review(
+            "No reliable tie detection was produced. Manual review is required.",
+            status="uncertain", visible=True, model_version=model_version,
+            reason="no_valid_detection", confidence=0.0,
+        )
 
-        conf = detection.confidence
-        bbox_dict = {
-            "x1": int(detection.bbox[0]),
-            "y1": int(detection.bbox[1]),
-            "x2": int(detection.bbox[2]),
-            "y2": int(detection.bbox[3]),
-        }
+    bbox = {key: int(value) for key, value in zip(("x1", "y1", "x2", "y2"), detection.bbox)}
+    valid, reason = validate_tie_detection(detection, face, w, h, geometry)
+    if not valid:
+        if getattr(detector, "supports_absence_decision", False) is True:
+            return _tie_absent_result(
+                model_version, reason=reason, confidence=detection.confidence, bbox=bbox,
+            )
+        return _tie_manual_review(
+            "Tie-like object is outside the expected neck/chest region. Manual review is required.",
+            status="uncertain", visible=True, model_version=model_version,
+            reason=reason, confidence=round(detection.confidence, 4), bbox=bbox,
+        )
+    if detection.confidence < threshold:
+        if getattr(detector, "supports_absence_decision", False) is True:
+            return _tie_absent_result(
+                model_version, reason="below_positive_threshold",
+                confidence=detection.confidence, bbox=bbox,
+            )
+        return _tie_manual_review(
+            "Tie detection confidence is below the calibrated auto-approval level. Manual review is required.",
+            status="uncertain", visible=True, model_version=model_version,
+            reason="below_calibrated_positive_threshold",
+            confidence=round(detection.confidence, 4), bbox=bbox,
+            tie_present_threshold=threshold,
+        )
 
-        if conf >= require_threshold:
-            return {
-                "passed": True,
-                "message": "Tie / formal neckwear detected.",
-                "meta": {
-                    "decision": "accept",
-                    "tie_status": "tie_present",
-                    "tie_detected": True,
-                    "confidence": round(conf, 4),
-                    "upper_body_visible": True,
-                    "bbox": bbox_dict,
-                    "model_version": model_version,
-                },
-            }
-
-        if conf <= accept_threshold:
-            return {
-                "passed": False,
-                "message": (
-                    "Tie / formal neckwear not detected. "
-                    "This institution requires formal attire with a tie."
-                ),
-                "meta": {
-                    "decision": "reject",
-                    "tie_status": "tie_absent",
-                    "tie_detected": False,
-                    "confidence": round(conf, 4),
-                    "upper_body_visible": True,
-                    "bbox": bbox_dict,
-                    "model_version": model_version,
-                },
-            }
-
-        return {
-            "passed": False,
-            "message": (
-                "Tie / formal neckwear detection is uncertain. "
-                "Manual review is required."
-            ),
-            "meta": {
-                "decision": "manual_review",
-                "tie_status": "uncertain",
-                "tie_detected": None,
-                "confidence": round(conf, 4),
-                "upper_body_visible": True,
-                "bbox": bbox_dict,
-                "model_version": model_version,
-            },
-        }
-
-    # --- Robust CV tie analysis fallback ---
-    cv_res = _analyze_tie_cv(bgr, faces)
-    if cv_res["has_tie"]:
-        return {
-            "passed": True,
-            "message": "Tie / formal neckwear detected.",
-            "meta": {
-                "decision": "accept",
-                "tie_status": "tie_present",
-                "tie_detected": True,
-                "upper_body_visible": True,
-                "blade_contrast": cv_res["blade_contrast"],
-                "contrast_ratio": cv_res["contrast_ratio"],
-                "vert_edge_score": cv_res["vert_edge_score"],
-                "model_version": model_version,
-            },
-        }
-
-    reason_text = " (open collar / bare neck)" if cv_res.get("reason") == "bare_skin" else ""
     return {
-        "passed": False,
-        "message": f"Tie / formal neckwear not detected{reason_text}. This institution requires formal attire with a tie.",
+        "passed": True,
+        "message": "Tie / formal neckwear detected.",
         "meta": {
-            "decision": "reject",
-            "tie_status": "tie_absent",
-            "tie_detected": False,
+            "decision": "accept",
+            "tie_status": "tie_present",
+            "tie_detected": True,
+            "confidence": round(detection.confidence, 4),
             "upper_body_visible": True,
-            "reason": cv_res.get("reason"),
-            "blade_contrast": cv_res["blade_contrast"],
-            "contrast_ratio": cv_res["contrast_ratio"],
-            "vert_edge_score": cv_res["vert_edge_score"],
+            "bbox": bbox,
             "model_version": model_version,
         },
     }
@@ -1104,6 +1103,14 @@ def check_no_tie(bgr, faces, params):
 
     detection = detector.detect(roi_pil, roi_offset=(roi_x1, roi_y1))
 
+    # Apply the same face-relative localization guard used by require_tie.
+    # A high detector score on a lapel, necklace, background pattern, or a
+    # second person must never be treated as a visible tie.
+    calibrated_threshold, geometry, policy_version = _tie_positive_policy(detector, params)
+    if isinstance(getattr(detector, "policy", None), TieModelPolicy):
+        reject_threshold = calibrated_threshold
+        model_version = policy_version
+
     if detection is None:
         return {
             "passed": True,
@@ -1128,6 +1135,15 @@ def check_no_tie(bgr, faces, params):
         "x2": int(detection.bbox[2]),
         "y2": int(detection.bbox[3]),
     }
+
+    valid, localization_reason = validate_tie_detection(detection, face, w, h, geometry)
+    if not valid:
+        return _tie_manual_review(
+            "Tie-like object is outside the expected neck/chest region. Manual review is required.",
+            status="uncertain", visible=True, model_version=model_version,
+            reason=localization_reason, confidence=round(detection.confidence, 4),
+            bbox=bbox_dict,
+        )
 
     if conf >= reject_threshold:
         return {
@@ -1162,6 +1178,25 @@ def check_no_tie(bgr, faces, params):
             },
         }
 
+    # --- Uncertain band: cross-check with CV heuristic for corroboration ---
+    cv_res = _analyze_tie_cv(bgr, faces)
+    if cv_res["has_tie"]:
+        # Both signals agree: tie is present → reject
+        return {
+            "passed": False,
+            "message": "Visible necktie detected in the upper-body region.",
+            "meta": {
+                "decision": "reject",
+                "tie_status": "tie_present",
+                "tie_detected": True,
+                "confidence": round(conf, 4),
+                "upper_body_visible": True,
+                "bbox": bbox_dict,
+                "corroborated_by_cv": True,
+                "model_version": model_version,
+            },
+        }
+    # CV disagrees (no tie) while model is uncertain → manual review
     return {
         "passed": False,
         "message": (

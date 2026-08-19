@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "model_version": "tie-detector-v1.0.0",
+  "model_sha256": "REPLACE_WITH_SHA256_OF_tie_detector_v1.pt",
+  "input_contract": "face_relative_upper_body_v1",
+  "decision": {
+    "tie_present_threshold": 0.85
+  },
+  "geometry": {
+    "min_width_face_ratio": 0.04,
+    "max_width_face_ratio": 0.85,
+    "min_height_face_ratio": 0.12,
+    "max_height_face_ratio": 1.6,
+    "min_top_offset_face_ratio": -0.3,
+    "max_top_offset_face_ratio": 1.35,
+    "max_center_offset_face_ratio": 0.6
+  },
+  "held_out_metrics": {
+    "image_precision": 0.99,
+    "image_recall": 0.95,
+    "false_positive_rate": 0.005
+  },
+  "minimum_metrics": {
+    "image_precision": 0.98,
+    "image_recall": 0.93,
+    "false_positive_rate": 0.01
+  }
+}

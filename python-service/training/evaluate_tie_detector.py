@@ -126,19 +126,6 @@ def compute_metrics(predictions, ground_truth, score_threshold: float = 0.5,
         pred_boxes = pred_boxes[mask]
         pred_scores = pred_scores[mask]
 
-        has_gt = len(gt_boxes) > 0
-        has_pred = len(pred_boxes) > 0
-
-        # Image-level
-        if has_gt and has_pred:
-            correct_rejections += 1
-        elif has_gt and not has_pred:
-            false_acceptances += 1
-        elif not has_gt and has_pred:
-            false_rejections += 1
-        else:
-            correct_acceptances += 1
-
         # Box-level
         matched_gt = set()
         for pb, ps in zip(pred_boxes, pred_scores):
@@ -158,12 +145,32 @@ def compute_metrics(predictions, ground_truth, score_threshold: float = 0.5,
                 fp += 1
         fn += len(gt_boxes) - len(matched_gt)
 
+        # Image-level decisions must require a correctly localized tie.  The
+        # previous implementation counted any box anywhere in a tie image as
+        # a correct detection, hiding poor localization and inflated recall.
+        has_gt = len(gt_boxes) > 0
+        localized_tie = bool(matched_gt)
+        has_pred = len(pred_boxes) > 0
+        if has_gt and localized_tie:
+            correct_rejections += 1
+        elif has_gt:
+            false_acceptances += 1
+        elif has_pred:
+            false_rejections += 1
+        else:
+            correct_acceptances += 1
+
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
     fpr = false_rejections / images_without_tie if images_without_tie > 0 else 0.0
     fnr = false_acceptances / images_with_tie if images_with_tie > 0 else 0.0
+    image_precision = (
+        correct_rejections / (correct_rejections + false_rejections)
+        if (correct_rejections + false_rejections) > 0 else 0.0
+    )
+    image_recall = correct_rejections / images_with_tie if images_with_tie > 0 else 0.0
 
     return {
         "detector_metrics": {
@@ -177,6 +184,8 @@ def compute_metrics(predictions, ground_truth, score_threshold: float = 0.5,
         "business_metrics": {
             "false_positive_rate": round(fpr, 4),
             "false_negative_rate": round(fnr, 4),
+            "image_precision": round(image_precision, 4),
+            "image_recall": round(image_recall, 4),
             "correct_rejections": correct_rejections,
             "false_acceptances": false_acceptances,
             "correct_acceptances": correct_acceptances,

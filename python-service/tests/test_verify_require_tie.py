@@ -53,11 +53,11 @@ class TestCheckRequireTie(unittest.TestCase):
         self.assertTrue(result["meta"]["tie_detected"])
         self.assertIn("model_version", result["meta"])
 
-    # --- Tie absent -> passed=False ---
+    # --- No detection -> manual review (a detector cannot prove absence) ---
 
     @patch("verify.get_tie_detector")
-    def test_tie_absent_rejects(self, mock_get_detector):
-        """No detection should reject (passed=False) when tie is required."""
+    def test_tie_absent_requires_manual_review(self, mock_get_detector):
+        """No box is ambiguous, not proof that a required tie is absent."""
         mock_detector = MagicMock()
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
@@ -67,15 +67,15 @@ class TestCheckRequireTie(unittest.TestCase):
         result = check_tie(bgr, faces, {})
 
         self.assertFalse(result["passed"])
-        self.assertEqual(result["meta"]["decision"], "reject")
-        self.assertEqual(result["meta"]["tie_status"], "tie_absent")
-        self.assertFalse(result["meta"]["tie_detected"])
+        self.assertEqual(result["meta"]["decision"], "manual_review")
+        self.assertEqual(result["meta"]["tie_status"], "uncertain")
+        self.assertIsNone(result["meta"]["tie_detected"])
 
-    # --- Low confidence detection -> treat as absent (reject) ---
+    # --- Low confidence detection -> manual review ---
 
     @patch("verify.get_tie_detector")
-    def test_low_confidence_rejects(self, mock_get_detector):
-        """Detection below accept_threshold should be treated as absent (reject)."""
+    def test_low_confidence_requires_manual_review(self, mock_get_detector):
+        """Weak positive evidence cannot prove a tie is present or absent."""
         mock_detector = MagicMock()
         mock_detector.detect.return_value = TieDetection(
             confidence=0.10, bbox=(200, 350, 280, 550)
@@ -87,8 +87,23 @@ class TestCheckRequireTie(unittest.TestCase):
         result = check_tie(bgr, faces, {"tie_accept_threshold": 0.30})
 
         self.assertFalse(result["passed"])
-        self.assertEqual(result["meta"]["decision"], "reject")
-        self.assertEqual(result["meta"]["tie_status"], "tie_absent")
+        self.assertEqual(result["meta"]["decision"], "manual_review")
+        self.assertEqual(result["meta"]["tie_status"], "uncertain")
+
+    @patch("verify.get_tie_detector")
+    def test_off_chest_detection_requires_manual_review(self, mock_get_detector):
+        """A confident object away from the neck/chest cannot be a valid tie."""
+        mock_detector = MagicMock()
+        mock_detector.detect.return_value = TieDetection(
+            confidence=0.99, bbox=(5, 350, 80, 550)
+        )
+        mock_get_detector.return_value = mock_detector
+
+        result = check_tie(_make_image(), _make_faces(), {})
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["meta"]["decision"], "manual_review")
+        self.assertEqual(result["meta"]["reason"], "implausible_horizontal_position")
 
     # --- Uncertain -> passed=False + manual_review ---
 
@@ -182,8 +197,8 @@ class TestRequireTieHardComplianceGate(unittest.TestCase):
 
     @patch("verify._detect_faces", return_value=MOCK_FACE)
     @patch("verify.get_tie_detector")
-    def test_tie_absent_blocks_overall_pass(self, mock_get_detector, mock_detect_faces):
-        """When no tie is detected and require_tie is enabled, overall_passed must be False."""
+    def test_missing_detection_blocks_overall_pass(self, mock_get_detector, mock_detect_faces):
+        """Ambiguous missing detection must block auto-approval."""
         mock_detector = MagicMock()
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
@@ -248,8 +263,8 @@ class TestRequireTieRealWorldImage(unittest.TestCase):
         self.assertFalse(result["results"]["require_tie"]["passed"])
         self.assertFalse(result["overall_passed"])
 
-    def test_user_uploaded_striped_tie_photo_passes_require_tie(self):
-        """User uploaded portrait with white shirt and striped tie must pass require_tie."""
+    def test_user_uploaded_striped_tie_photo_passes_with_coco_backend(self):
+        """The bundled COCO backend detects a real traditional necktie."""
         candidate_paths = [
             pathlib.Path("/Users/georgeakidima/.gemini/antigravity-ide/brain/8508fd68-841b-46b0-9288-a4066302f061/.user_uploaded/media_1786962279199.jpg"),
             pathlib.Path("/Users/georgeakidima/.gemini/antigravity-ide/brain/8508fd68-841b-46b0-9288-a4066302f061/.user_uploaded/media_1786962271625.jpg"),
@@ -270,8 +285,8 @@ class TestRequireTieRealWorldImage(unittest.TestCase):
         self.assertTrue(tie_res["meta"]["upper_body_visible"])
         self.assertTrue(tie_res["meta"]["tie_detected"])
 
-    def test_solid_white_shirt_no_tie_rejected(self):
-        """A synthetic portrait with solid white shirt and no tie must be rejected."""
+    def test_solid_white_shirt_without_tie_is_not_accepted(self):
+        """A no-tie image must not pass the required-tie criterion."""
         # White shirt without tie
         bgr = np.full((600, 400, 3), 250, dtype=np.uint8)
         # Add head/face
@@ -279,8 +294,8 @@ class TestRequireTieRealWorldImage(unittest.TestCase):
         faces = [{"x": 120, "y": 80, "w": 160, "h": 200, "score": 1.0, "keypoints": None}]
         tie_res = check_tie(bgr, faces, {})
         self.assertFalse(tie_res["passed"])
-        self.assertEqual(tie_res["meta"]["decision"], "reject")
-        self.assertFalse(tie_res["meta"]["tie_detected"])
+        self.assertIn(tie_res["meta"]["decision"], ("reject", "manual_review"))
+        self.assertNotEqual(tie_res["meta"]["tie_detected"], True)
 
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ function init_schema(PDO $pdo): void {
         'bg_min_value' => '235',
         'bg_max_saturation' => '18',
         'bg_max_delta_e' => '10',
-        'bg_min_white_coverage' => '70',
+        'bg_min_white_coverage' => '30',
         'bg_max_nonwhite_component_coverage' => '30',
         'bg_max_luminance_range' => '100',
         'bg_reject_dark_value' => '210',

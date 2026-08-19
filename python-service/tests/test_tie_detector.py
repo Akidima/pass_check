@@ -14,7 +14,18 @@ from dataclasses import FrozenInstanceError
 from PIL import Image
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from tie_detector import TieDetection, TieDetector, get_tie_detector
+from tie_detector import TieDetection, TieDetector, get_tie_detector, validate_tie_detection
+
+
+GEOMETRY = {
+    "min_width_face_ratio": 0.04,
+    "max_width_face_ratio": 0.85,
+    "min_height_face_ratio": 0.12,
+    "max_height_face_ratio": 1.60,
+    "min_top_offset_face_ratio": -0.30,
+    "max_top_offset_face_ratio": 1.35,
+    "max_center_offset_face_ratio": 0.60,
+}
 
 
 class FakeDetector:
@@ -39,6 +50,32 @@ class TestTieDetection(unittest.TestCase):
         d = TieDetection(confidence=0.5, bbox=(0, 0, 10, 10))
         with self.assertRaises((AttributeError, FrozenInstanceError)):
             d.confidence = 0.9
+
+
+class TestTieDetectionLocalization(unittest.TestCase):
+    def test_centered_chest_box_is_valid(self):
+        detection = TieDetection(confidence=0.95, bbox=(220, 310, 280, 490))
+        valid, reason = validate_tie_detection(
+            detection, {"x": 150, "y": 80, "w": 200, "h": 200}, 500, 700, GEOMETRY
+        )
+        self.assertTrue(valid)
+        self.assertEqual(reason, "valid")
+
+    def test_lapel_or_background_box_is_rejected(self):
+        detection = TieDetection(confidence=0.99, bbox=(5, 310, 65, 490))
+        valid, reason = validate_tie_detection(
+            detection, {"x": 150, "y": 80, "w": 200, "h": 200}, 500, 700, GEOMETRY
+        )
+        self.assertFalse(valid)
+        self.assertEqual(reason, "implausible_horizontal_position")
+
+    def test_out_of_image_box_is_rejected(self):
+        detection = TieDetection(confidence=0.99, bbox=(220, 310, 550, 490))
+        valid, reason = validate_tie_detection(
+            detection, {"x": 150, "y": 80, "w": 200, "h": 200}, 500, 700, GEOMETRY
+        )
+        self.assertFalse(valid)
+        self.assertEqual(reason, "bbox_out_of_image")
 
 
 class TestFakeDetectorProtocol(unittest.TestCase):
@@ -87,7 +124,10 @@ class TestGetTieDetector(unittest.TestCase):
         """When model file doesn't exist, get_tie_detector should raise."""
         # Clear lru_cache between tests
         get_tie_detector.cache_clear()
-        with patch.dict("os.environ", {"TIE_MODEL_PATH": "/nonexistent/model.pt"}):
+        with patch.dict("os.environ", {
+            "TIE_MODEL_PATH": "/nonexistent/model.pt",
+            "TIE_DETECTOR_BACKEND": "custom",
+        }):
             with self.assertRaises(FileNotFoundError):
                 get_tie_detector()
         get_tie_detector.cache_clear()
@@ -98,20 +138,19 @@ class TestGetTieDetector(unittest.TestCase):
         with patch.dict("os.environ", {
             "TIE_MODEL_PATH": "/nonexistent/model.pt",
             "TIE_MODEL_DEVICE": "invalid_device",
+            "TIE_DETECTOR_BACKEND": "custom",
         }):
             with self.assertRaises(FileNotFoundError):
                 get_tie_detector()
         get_tie_detector.cache_clear()
 
-    def test_default_env_vars(self):
-        """Default env vars should point to models/tie_detector_v1.pt."""
+    @patch("tie_detector.CocoTieDetector")
+    def test_default_auto_backend_uses_coco_when_custom_model_is_absent(self, mock_coco):
+        """The app must remain usable before a custom checkpoint is trained."""
         get_tie_detector.cache_clear()
-        # This will raise FileNotFoundError because the model doesn't exist,
-        # but we can verify the error message mentions the default path.
-        try:
+        with patch.dict("os.environ", {"TIE_DETECTOR_BACKEND": "auto"}, clear=False):
             get_tie_detector()
-        except FileNotFoundError as e:
-            self.assertIn("tie_detector_v1.pt", str(e))
+        mock_coco.assert_called_once()
         get_tie_detector.cache_clear()
 
 

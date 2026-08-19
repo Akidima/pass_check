@@ -107,6 +107,43 @@ python app.py
 
 Runs on `http://127.0.0.1:5001`. Verify with `http://127.0.0.1:5001/health`.
 
+### Tie detection deployment contract
+
+The repository intentionally ships without a university-specific tie model.
+By default (`TIE_DETECTOR_BACKEND=auto`), it uses torchvision's maintained
+COCO detector, which has a built-in **traditional necktie** class, so the
+application works immediately. A visible chest ROI with a valid conventional
+tie box passes; an ROI without one fails the required-tie criterion. The
+face-relative localization gate rejects high-scoring tie-like objects on a
+lapel, background, or another garment. Set `TIE_DETECTOR_BACKEND=custom` only
+after deploying the calibrated custom model described below.
+
+Deploy a model only with its adjacent policy file:
+
+```text
+python-service/models/tie_detector_v1.pt
+python-service/models/tie_detector_v1.policy.json
+```
+
+Start from [`python-service/models/tie_detector.policy.example.json`](python-service/models/tie_detector.policy.example.json).
+The policy binds the custom model SHA-256, calibrated positive threshold,
+face-relative box limits, and held-out metrics. The service refuses a missing,
+stale, malformed, or below-target policy. Set `TIE_MODEL_PATH` and, when the
+policy is not adjacent to the model, `TIE_MODEL_POLICY_PATH`.
+
+The training set must contain both tie and no-tie passport photos, identity
+disjoint train/validation/test splits, and hard negatives (open collars,
+V-necks, scarves, necklaces, lanyards, patterned shirts, lapels, and visible
+background objects). Label full tie boxes consistently, including the knot.
+Training images must use the same `face_relative_upper_body_v1` crop emitted
+by `UpperBodyVisibilityEstimator` at inference; do not train on full portraits
+and infer on chest crops. Transform the annotation coordinates when producing
+those crops, discard boxes outside a crop, and retain no-tie crops as empty
+annotations. Calibrate the score and geometry only on validation data, then report the
+held-out test metrics before promotion. `training/evaluate_tie_detector.py`
+now counts a tie-image prediction as correct only when it overlaps the labeled
+tie at the configured IoU; a box elsewhere can no longer inflate recall.
+
 > First run of MediaPipe/OpenCV installs may take a few minutes. Requires Python 3.9–3.12 (mediapipe wheels).
 
 ### 2. PHP web app
