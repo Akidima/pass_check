@@ -56,7 +56,7 @@ include __DIR__ . '/../includes/header.php';
             <tr id="row-<?= (int)$s['id'] ?>">
               <td>
                 <img id="thumb-<?= (int)$s['id'] ?>" src="/uploads/<?= htmlspecialchars($s['filename']) ?>"
-                     style="width:52px;height:52px;object-fit:cover;border-radius:8px;border:2px solid var(--navy-600);background:repeating-conic-gradient(rgba(255,255,255,0.06) 0% 25%, transparent 0% 50%) 0 0/10px 10px, var(--navy-900);box-shadow:0 2px 8px -2px rgba(0,0,0,0.5);" alt="">
+                     class="submission-thumb" alt="">
               </td>
               <td>
                 <strong><?= htmlspecialchars($s['student_name'] ?: '—') ?></strong><br>
@@ -102,12 +102,13 @@ include __DIR__ . '/../includes/header.php';
       <div class="edit-grid">
         <!-- Live Preview Canvas / Image -->
         <div class="preview-box">
-          <div class="preview-label">Live Preview</div>
-          <div class="img-container">
-            <canvas id="editorCanvas"></canvas>
-            <img id="editorImage" src="" style="display:none;" alt="Photo source">
+          <div class="preview-label">Passport Photo Preview</div>
+          <div class="passport-frame">
+            <div class="img-container">
+              <canvas id="editorCanvas"></canvas>
+              <img id="editorImage" src="" style="display:none;" alt="Photo source">
+            </div>
           </div>
-          <div class="resolution-info" id="editorResDisplay">Dimensions: --</div>
         </div>
 
         <!-- Controls -->
@@ -243,7 +244,7 @@ include __DIR__ . '/../includes/header.php';
   border: 1px solid var(--navy-600);
   border-radius: var(--radius-lg);
   width: 100%;
-  max-width: 780px;
+  max-width: 960px;
   box-shadow: var(--shadow-lift);
   overflow: hidden;
   display: flex;
@@ -265,7 +266,7 @@ include __DIR__ . '/../includes/header.php';
 
 .edit-grid {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 24px;
 }
 @media (max-width: 680px) {
@@ -276,36 +277,71 @@ include __DIR__ . '/../includes/header.php';
   background: var(--navy-900);
   border: 1px solid var(--navy-700);
   border-radius: var(--radius-md);
-  padding: 16px;
+  padding: 20px;
   display: flex;
   flex-direction: column;
   align-items: center;
 }
-.preview-label { font-size: 12px; color: var(--ink-500); margin-bottom: 10px; font-weight: 600; text-transform: uppercase; }
+.preview-label {
+  font-size: 11px;
+  color: var(--ink-500);
+  margin-bottom: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* Passport photo frame — 7:9 ratio (35×45mm ICAO standard) */
+.passport-frame {
+  position: relative;
+  width: 100%;
+  max-width: 320px;
+  padding: 18px 28px 18px 18px;
+}
+.passport-dim {
+  position: absolute;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ink-500);
+  letter-spacing: 0.5px;
+  pointer-events: none;
+}
+.passport-dim-w {
+  bottom: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.passport-dim-h {
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%) rotate(90deg);
+  transform-origin: center center;
+}
 .img-container {
-  width: 220px;
-  height: 260px;
-  border-radius: var(--radius-sm);
+  width: 100%;
+  aspect-ratio: 7 / 9;
+  border-radius: 6px;
   overflow: hidden;
-  background:
-    repeating-conic-gradient(rgba(255,255,255,0.05) 0% 25%, transparent 0% 50%) 0 0 / 14px 14px,
-    var(--navy-950);
-  border: 2px solid var(--navy-700);
+  background: #e8e8e8;
+  border: 2px solid var(--navy-600);
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35);
+  box-shadow:
+    0 1px 3px rgba(0,0,0,0.25),
+    inset 0 0 0 1px rgba(0,0,0,0.15);
 }
 .img-container canvas {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
   transition: filter 0.1s ease;
 }
 .resolution-info {
-  margin-top: 10px;
-  font-size: 12px;
+  margin-top: 14px;
+  font-size: 11.5px;
   color: var(--ink-300);
+  text-align: center;
 }
 
 .controls-box { display: flex; flex-direction: column; gap: 16px; }
@@ -336,7 +372,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const editorImage = document.getElementById('editorImage');
   const editorCanvas = document.getElementById('editorCanvas');
-  const editorResDisplay = document.getElementById('editorResDisplay');
   const editSubmissionId = document.getElementById('editSubmissionId');
   const editFilename = document.getElementById('editFilename');
 
@@ -352,7 +387,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let cutoutImage = null;
   let cutoutLoading = false;
-  let cutoutSubmissionId = null;
+  let activeCutoutController = null;
   let colorPreviewCache = {};
 
   const editBgColor = document.getElementById('editBgColor');
@@ -378,12 +413,17 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   async function fetchCutout(id) {
-    if (!id || cutoutLoading) return;
+    if (!id) return;
+    if (activeCutoutController) {
+      activeCutoutController.abort();
+    }
+    activeCutoutController = new AbortController();
     cutoutLoading = true;
     try {
       const resp = await fetch('edit_photo.php', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: activeCutoutController.signal,
         body: JSON.stringify({
           submission_id: id,
           get_cutout: true
@@ -406,7 +446,9 @@ document.addEventListener('DOMContentLoaded', () => {
         cutoutLoading = false;
       }
     } catch (err) {
-      cutoutLoading = false;
+      if (err.name !== 'AbortError') {
+        cutoutLoading = false;
+      }
     }
   }
 
@@ -446,10 +488,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const b = parseInt(brightnessRange.value, 10);
     const s = parseFloat(sharpnessRange.value);
 
-    brightnessValue.textContent = (b > 0 ? '+' : '') + b;
-    sharpnessValue.textContent = s.toFixed(1);
+    if (brightnessValue) brightnessValue.textContent = (b > 0 ? '+' : '') + b;
+    if (sharpnessValue) sharpnessValue.textContent = s.toFixed(1);
 
-    if (!editorImage.complete || !editorImage.naturalWidth) return;
+    if (!editorImage || !editorImage.complete || !editorImage.naturalWidth) return;
 
     const w = editorImage.naturalWidth;
     const h = editorImage.naturalHeight;
@@ -533,37 +575,58 @@ document.addEventListener('DOMContentLoaded', () => {
       editSubmissionId.value = id;
       editFilename.value = filename;
 
-      // Reset controls & cutout state
+      // Abort any pending cutout requests
+      if (activeCutoutController) {
+        activeCutoutController.abort();
+        activeCutoutController = null;
+      }
+
+      // Reset controls & state
       brightnessRange.value = 0;
       sharpnessRange.value = 1.0;
+      resWidth.value = 1254;
+      resHeight.value = 1612;
       cutoutImage = null;
       cutoutLoading = false;
-      cutoutSubmissionId = id;
       colorPreviewCache = {};
-      setBgColor('');
+      editBgColor.value = '';
+      swatches.forEach(s => s.classList.toggle('active', s.dataset.color === ''));
 
-      const imgSrc = `/uploads/${filename}?t=${Date.now()}`;
-      editorImage.src = imgSrc;
+      // Clear the canvas immediately so previous image is never shown
+      const ctx = editorCanvas.getContext('2d');
+      ctx.clearRect(0, 0, editorCanvas.width, editorCanvas.height);
+      editorCanvas.width = 1;
+      editorCanvas.height = 1;
 
-      editorImage.onload = () => {
-        currentNaturalWidth = editorImage.naturalWidth;
-        currentNaturalHeight = editorImage.naturalHeight;
-        resWidth.value = currentNaturalWidth;
-        resHeight.value = currentNaturalHeight;
-        editorResDisplay.textContent = `Original: ${currentNaturalWidth} × ${currentNaturalHeight} px`;
+      // Reset source
+      editorImage.src = '';
+      editorImage.onload = null;
+
+      modal.classList.remove('hidden');
+
+      // Load new selected image cleanly
+      const loadImg = new Image();
+      loadImg.onload = () => {
+        if (editSubmissionId.value !== id) return;
+        editorImage.src = loadImg.src;
+        currentNaturalWidth = loadImg.naturalWidth;
+        currentNaturalHeight = loadImg.naturalHeight;
         updateLivePreview();
       };
-
-      // Pre-fetch transparent subject cutout immediately so switching colors is instant (0ms)!
-      fetchCutout(id);
-
-      updateLivePreview();
-      modal.classList.remove('hidden');
+      loadImg.src = `/uploads/${filename}?t=${Date.now()}`;
     });
   });
 
   function closeModal() {
     modal.classList.add('hidden');
+    if (activeCutoutController) {
+      activeCutoutController.abort();
+      activeCutoutController = null;
+    }
+    const ctx = editorCanvas.getContext('2d');
+    ctx.clearRect(0, 0, editorCanvas.width, editorCanvas.height);
+    editorImage.src = '';
+    editorImage.onload = null;
   }
 
   closeModalBtn.addEventListener('click', closeModal);
@@ -572,8 +635,8 @@ document.addEventListener('DOMContentLoaded', () => {
   resetEditsBtn.addEventListener('click', () => {
     brightnessRange.value = 0;
     sharpnessRange.value = 1.0;
-    resWidth.value = currentNaturalWidth;
-    resHeight.value = currentNaturalHeight;
+    resWidth.value = 1254;
+    resHeight.value = 1612;
     setBgColor('');
     updateLivePreview();
   });

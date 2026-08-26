@@ -4,7 +4,10 @@
  * Creates schema on first run.
  */
 
-define('DB_PATH', __DIR__ . '/../data/database.sqlite');
+// Database location. PASS_CHECK_DB_PATH lets tests (and alternative
+// deployments) point the app at an isolated SQLite file without touching
+// the developer/administrator database.
+define('DB_PATH', getenv('PASS_CHECK_DB_PATH') ?: (__DIR__ . '/../data/database.sqlite'));
 
 function get_db(): PDO {
     static $pdo = null;
@@ -102,24 +105,10 @@ function init_schema(PDO $pdo): void {
         'python_service_url' => 'http://127.0.0.1:5001',
         'university_name' => 'University Passport Photo Verification System',
         'max_attempts' => '5',
-        'min_pass_criteria' => '4',
-        // White-background verification settings. These are forwarded to the
-        // Python CV service for every request and are the administrator's
-        // source of truth (the default requires 70% visible white background).
-        'bg_min_value' => '235',
-        'bg_max_saturation' => '18',
-        'bg_max_delta_e' => '10',
-        'bg_min_white_coverage' => '30',
-        'bg_max_nonwhite_component_coverage' => '30',
-        'bg_max_luminance_range' => '100',
-        'bg_reject_dark_value' => '210',
-        'bg_max_dark_coverage' => '5',
-        'bg_reject_colored_saturation' => '30',
-        'bg_max_colored_coverage' => '5',
-        'bg_border_fraction' => '0.12',
-        // Sharpness / blur quality policy. These control the tiered blur
-        // severity system that prevents moderately blurred but genuinely
-        // white-background photos from being rejected unnecessarily.
+        // Background strictness and near-white acceptance defaults
+        'background_strictness' => 'standard',
+        'background_near_white_acceptance' => 'auto',
+        // Sharpness and blur quality defaults
         'blur_threshold' => '80',
         'blur_severe_threshold' => '15',
         'blur_soft_fail' => '1',
@@ -134,27 +123,37 @@ function init_schema(PDO $pdo): void {
         }
     }
 
-    // Upgrade installations that still have the old generated defaults. Values
-    // explicitly changed by an administrator are left untouched.
-    $legacyDefaults = [
-        'bg_max_nonwhite_component_coverage' => ['0', '30'],
-        'bg_max_luminance_range' => ['3', '100'],
-        'bg_min_value' => ['250', '235'],
-        'bg_max_saturation' => ['6', '18'],
-        'bg_max_delta_e' => ['3', '10'],
-        'bg_reject_dark_value' => ['220', '210'],
-        'bg_max_dark_coverage' => ['0', '5'],
-        'bg_reject_colored_saturation' => ['20', '30'],
-        'bg_max_colored_coverage' => ['0', '5'],
+    // Clean up legacy per-field settings if upgrading from older schema
+    $legacyBgFieldKeys = [
+        'bg_min_value',
+        'bg_max_saturation',
+        'bg_max_delta_e',
+        'bg_near_white_min_l_star',
+        'bg_near_white_max_chroma',
+        'bg_near_white_max_b_star',
+        'bg_min_white_coverage',
+        'bg_max_nonwhite_component_coverage',
+        'bg_max_luminance_range',
+        'bg_reject_dark_value',
+        'bg_max_dark_coverage',
+        'bg_reject_colored_saturation',
+        'bg_max_colored_coverage',
+        'bg_border_fraction',
     ];
+    $deleteSetting = $pdo->prepare("DELETE FROM settings WHERE setting_key = ?");
+    foreach ($legacyBgFieldKeys as $key) {
+        $deleteSetting->execute([$key]);
+    }
+
+    // Migrate legacy near-white toggle if present
     $readSetting = $pdo->prepare("SELECT setting_value FROM settings WHERE setting_key = ?");
     $updateSetting = $pdo->prepare("UPDATE settings SET setting_value = ? WHERE setting_key = ?");
-    foreach ($legacyDefaults as $key => [$legacyValue, $replacement]) {
-        $readSetting->execute([$key]);
-        if ($readSetting->fetchColumn() === $legacyValue) {
-            $updateSetting->execute([$replacement, $key]);
-        }
+    $readSetting->execute(['bg_near_white_enabled']);
+    $legacySwitch = $readSetting->fetchColumn();
+    if ($legacySwitch !== false && in_array($legacySwitch, ['1', '0'], true)) {
+        $updateSetting->execute([$legacySwitch, 'background_near_white_acceptance']);
     }
+    $deleteSetting->execute(['bg_near_white_enabled']);
 }
 
 function get_setting(string $key, string $default = ''): string {
@@ -185,4 +184,25 @@ function get_enabled_criteria(): array {
 function get_all_criteria(): array {
     $pdo = get_db();
     return $pdo->query("SELECT * FROM criteria ORDER BY sort_order ASC")->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/**
+ * Returns the current background validation configuration.
+ */
+function get_verification_settings(): array {
+    $allowedLevels = ['strict', 'standard', 'relaxed', 'accept_all'];
+    $strictness = get_setting('background_strictness', 'standard');
+    if (!in_array($strictness, $allowedLevels, true)) {
+        $strictness = 'standard';
+    }
+
+    $acceptance = get_setting('background_near_white_acceptance', 'auto');
+    if (!in_array($acceptance, ['auto', '1', '0'], true)) {
+        $acceptance = 'auto';
+    }
+
+    return [
+        'strictness' => $strictness,
+        'near_white_acceptance' => $acceptance,
+    ];
 }

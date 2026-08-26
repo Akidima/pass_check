@@ -139,6 +139,14 @@
     verifyBtn.disabled = !selectedBlob;
   }
 
+  // Cache default descriptions on load
+  document.querySelectorAll('.criteria-item').forEach((el) => {
+    const descEl = el.querySelector('.body span');
+    if (descEl && !el.dataset.defaultDesc) {
+      el.dataset.defaultDesc = descEl.textContent;
+    }
+  });
+
   // ---------- Checklist rendering ----------
   function resetChecklist() {
     resultBanner.innerHTML = '';
@@ -146,6 +154,10 @@
       el.classList.remove('pass', 'fail');
       el.classList.add('pending');
       el.querySelector('.status-dot').textContent = '•';
+      const descEl = el.querySelector('.body span');
+      if (descEl && el.dataset.defaultDesc) {
+        descEl.textContent = el.dataset.defaultDesc;
+      }
     });
   }
 
@@ -170,7 +182,13 @@
         el.classList.remove('pass');
         dot.textContent = '✕';
       }
-      if (check.message) descEl.textContent = check.message;
+      if (key === 'white_background') {
+        descEl.textContent = check.passed
+          ? (check.message || 'White bg accepted.')
+          : (check.message || 'White background not accepted, please try again.');
+      } else if (check.message) {
+        descEl.textContent = check.message;
+      }
     });
 
     if (result.overall_passed) {

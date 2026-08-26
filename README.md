@@ -53,32 +53,70 @@ does not contain a labelled background dataset, so it does not claim to use a
 trained model or a fabricated confidence metric.
 
 For each image, it samples the complete outer border while excluding a
-conservative region around any detected face and shoulders. Every remaining
-sample must satisfy the administrator-configured limits for RGB brightness, HSV
-saturation, and CIE-LAB distance from pure white. It also rejects excess total
-non-white coverage, a contiguous non-white mark, and luminance variation from
-shadows or gradients. No dark, tinted, or otherwise non-white samples are
-discarded before scoring.
+conservative region around any detected face and shoulders. A sampled pixel
+counts as acceptable white when it qualifies through either of two
+administrator-controlled tiers:
 
-Admin → Settings exposes these limits. The shipped defaults require a minimum
-RGB value of 250, saturation no greater than 6, LAB distance no greater than 3,
-and at least **70% white-background coverage**. A compliance failure for an
-enabled **Strictly White Background** criterion always blocks overall approval,
-even if the separate general pass-count threshold has been met.
+- **Pure white (always active)** — RGB brightness, HSV saturation, and
+  CIE-LAB distance to pure white within the configured limits. This is the
+  classic studio rule and still gates every strictness level.
+- **Near white (opt-in per level)** — slightly darker or lightly tinted by
+  warm/cool lighting but objectively near-white in CIE-LAB: high lightness
+  (L*), low chroma C*, and the tint confined to the neutral warm/cool (b*)
+  axis. This accepts light-grey studio walls, white walls under household
+  lighting, and exposure/compression drift. It uses objective image
+  characteristics only — no nationality-, region-, or demographic-based
+  rules — and never admits beige, cream, blue, green, or dark surfaces.
 
-The 70% allowance applies only to neutral near-white variation. By default,
-any visible dark/black background or chromatic coloured background is rejected;
-both guards have separate administrator settings and default to 0% permitted
-coverage.
+Independent hard guards run on every sampled pixel regardless of tier and can
+never be relaxed into accepting an unsuitable background: dark/black coverage,
+chromatic coverage, largest contiguous non-white component, total white
+coverage, and background luminance uniformity (p90–p10 of L*, which tolerates
+ordinary window-light gradients while still catching real shadows). A
+compliance failure for an enabled **Strictly White Background** criterion
+always blocks overall approval, even if the separate general pass-count
+threshold has been met.
 
-Each result stores the sampled-pixel count, white/non-white coverage, largest
-contamination component, LAB distance, luminance range, deterministic quality
-score, and thresholds used in `results.white_background.meta`.
+Admin → Settings controls background validation through EXACTLY TWO settings:
+
+| Control | Values | Effect |
+|---|---|---|
+| **White Background Strictness Level** | `strict` · `standard` · `relaxed` · `accept_all` | Selects one preset that supplies every image-analysis threshold (brightness / saturation / ΔE limits, the near-white band, coverage gates, and the dark/coloured guards) |
+| **Near-White Background Acceptance** | ON / OFF toggle | ON admits bright, almost colourless backgrounds photographed under real-world lighting (slightly dimmed or warm/cool-tinted white walls, light-grey studio backdrops). OFF enforces pure-white-only criteria |
+
+Level behaviour (`BACKGROUND_STRICTNESS_LEVELS` in
+`python-service/verify.py` is the single authoritative definition):
+
+| Level | Tier-1 limits | Near-white band | Coverage gates | Intended use |
+|---|---|---|---|---|
+| `strict` | value ≥ 235, sat ≤ 18, ΔE ≤ 10 | disabled by default | ≥ 30% white, ≤ 30% patch | International passport / NYSC: pure studio white only |
+| `standard` (default) | value ≥ 215, sat ≤ 28, ΔE ≤ 16 | L* ≥ 90, C* ≤ 13, \|b\*\| ≤ 13 | ≥ 60% white, ≤ 30% patch | Admission portals: light-grey walls, warm/cool lighting, mild shadows OK |
+| `relaxed` | value ≥ 180, sat ≤ 45, ΔE ≤ 25 | L* ≥ 86, C* ≤ 15, \|b\*\| ≤ 14 | ≥ 15% white, ≤ 60% patch | Home-taken photos with imperfect lighting |
+| `accept_all` | wide | wide | only the dark/coloured guards matter | Only rejects dark or vividly coloured backgrounds |
+
+The **Near-White Background Acceptance** toggle overrides the level default:
+ON forces the tier on at every level (Strict included), OFF forces it off
+everywhere (legacy pure-white-only behaviour). Beige, cream, blue, green and
+dark backgrounds are rejected regardless of both settings.
+
+The former per-field "Advanced Threshold" overrides were removed: they formed
+a second configuration source whose persisted values silently beat the chosen
+level, which is why changing the two settings above previously had no effect.
+The PHP API now forwards only the two controls; the Python service ignores
+and strips any per-field `bg_*` keys at its `/verify` boundary, and old
+databases are migrated (legacy rows deleted, an explicit legacy near-white
+choice carried over) on startup.
+
+Each result stores the sampled-pixel count, white/non-white coverage (split
+into pure-white and near-white coverage), largest contamination component,
+LAB distance, luminance range, deterministic quality score, and thresholds
+used in `results.white_background.meta`.
 
 Run the focused regression tests with:
 
 ```bash
 python-service/venv/bin/python -m unittest discover -s python-service/tests -v
+php tests/test_background_settings.php   # admin-settings persistence + migration
 ```
 
 For a reproducible local CPU-only timing run (without face detection or HTTP

@@ -602,6 +602,22 @@ tbody tr:hover { background: rgba(255,255,255,0.02); }
   box-shadow: inset 0 0 0 1px rgba(0,0,0,0.3);
 }
 
+/* Submission table thumbnail — same border/background as preview-thumb,
+   constrained to fit a table row while keeping the original aspect ratio. */
+.submission-thumb {
+  max-width: 60px;
+  max-height: 72px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 2px solid var(--navy-600);
+  background:
+    repeating-conic-gradient(rgba(255,255,255,0.06) 0% 25%, transparent 0% 50%) 0 0 / 10px 10px,
+    var(--navy-900);
+  box-shadow: 0 2px 8px -2px rgba(0,0,0,0.5);
+}
+
 .hidden { display: none !important; }
 
 .toast {

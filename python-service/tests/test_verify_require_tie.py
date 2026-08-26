@@ -274,6 +274,12 @@ class TestRequireTieRealWorldImage(unittest.TestCase):
         if test_path is None:
             self.skipTest("User uploaded tie test images not found")
 
+        try:
+            import torch  # noqa: F401
+            import torchvision  # noqa: F401
+        except ImportError:
+            self.skipTest("torch and torchvision not available for COCO backend")
+
         image_bytes = test_path.read_bytes()
         bgr = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         faces = _detect_faces(bgr)
