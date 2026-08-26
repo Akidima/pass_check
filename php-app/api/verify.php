@@ -52,24 +52,10 @@ $params = [
     'min_pass_criteria' => (int)get_setting('min_pass_criteria', '4'),
 ];
 
-// White-background limits are controlled only by the administrator's persisted
-// settings. Do not accept client-provided thresholds for this compliance check.
-$backgroundParamDefaults = [
-    'bg_min_value' => '235',
-    'bg_max_saturation' => '18',
-    'bg_max_delta_e' => '10',
-    'bg_min_white_coverage' => '30',
-    'bg_max_nonwhite_component_coverage' => '30',
-    'bg_max_luminance_range' => '100',
-    'bg_reject_dark_value' => '210',
-    'bg_max_dark_coverage' => '5',
-    'bg_reject_colored_saturation' => '30',
-    'bg_max_colored_coverage' => '5',
-    'bg_border_fraction' => '0.12',
-];
-foreach ($backgroundParamDefaults as $key => $default) {
-    $params[$key] = (float)get_setting($key, $default);
-}
+// Forward background verification settings
+$verificationSettings = get_verification_settings();
+$params['background_strictness'] = $verificationSettings['strictness'];
+$params['background_near_white_acceptance'] = $verificationSettings['near_white_acceptance'];
 
 // Sharpness / blur quality policy (admin-controlled, not client-configurable).
 $blurPolicyDefaults = [

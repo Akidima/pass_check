@@ -27,10 +27,7 @@ except Exception:
     rembg_remove = None
     REMBG_AVAILABLE = False
 
-# Verification never needs U2-Net segmentation. Keeping its model load lazy
-# prevents an optional photo-edit feature from adding cold-start latency or a
-# model-download failure to the student validation endpoint. The one session is
-# then safely cached for all later edit requests in this process.
+# Lazy-loaded rembg session for background editing
 REMBG_SESSION = None
 _REMBG_INIT_ATTEMPTED = False
 _REMBG_LOCK = threading.Lock()
@@ -384,6 +381,27 @@ def verify():
         params = json.loads(raw_params)
     except json.JSONDecodeError:
         params = {}
+
+    # Validate and normalize background parameters
+    level = str(params.get("background_strictness", "standard")).strip().lower()
+    params["background_strictness"] = (
+        level if level in ("strict", "standard", "relaxed", "accept_all") else "standard"
+    )
+
+    if "background_near_white_acceptance" in params:
+        switch = str(params["background_near_white_acceptance"]).strip().lower()
+        if switch not in ("auto", "1", "0"):
+            switch = "auto"
+        params["background_near_white_acceptance"] = switch
+    elif "bg_near_white_enabled" in params:
+        legacy = str(params["bg_near_white_enabled"]).strip().lower()
+        params["background_near_white_acceptance"] = (
+            legacy if legacy in ("auto", "1", "0") else "auto"
+        )
+        del params["bg_near_white_enabled"]
+
+    for key in [k for k in params if k.startswith("bg_")]:
+        del params[key]
 
     result = run_checks(image_bytes, enabled_criteria, params)
     status_code = 200 if "error" not in result else 422

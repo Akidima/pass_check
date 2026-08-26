@@ -5,18 +5,25 @@ require_admin();
 
 $message = '';
 $error = '';
-$whiteBackgroundFields = [
-    'bg_min_value' => ['Minimum RGB value', '235', 0, 255, 1, 'Every sampled background pixel must be at least this bright. Higher values are stricter (default 235 for mobile cameras).'],
-    'bg_max_saturation' => ['Maximum HSV saturation', '18', 0, 255, 1, 'Rejects tinted backgrounds while permitting warm/cool white lighting (default 18). Lower values are stricter.'],
-    'bg_max_delta_e' => ['Maximum LAB distance to pure white', '10', 0, 150, 0.1, 'Perceptual colour-distance limit from pure white (default 10.0 for real-world lighting). Lower values are stricter.'],
-    'bg_min_white_coverage' => ['Minimum white-background coverage (%)', '30', 0, 100, 0.01, 'At least this percentage of visible background must meet all white limits.'],
-    'bg_max_nonwhite_component_coverage' => ['Maximum contiguous non-white region (%)', '30', 0, 100, 0.01, 'Limits the size of a single non-white background patch.'],
-    'bg_max_luminance_range' => ['Maximum luminance range (L*)', '100', 0, 100, 0.1, 'Limits shadows and gradients across the sampled background. Lower values are stricter.'],
-    'bg_reject_dark_value' => ['Dark/black rejection value', '210', 0, 255, 1, 'Pixels darker than this are treated as black/dark background. Higher values are stricter.'],
-    'bg_max_dark_coverage' => ['Maximum dark/black coverage (%)', '5', 0, 100, 0.01, 'Maximum allowed dark/black background coverage (default 5% allows minor hair/bezel artifacts).'],
-    'bg_reject_colored_saturation' => ['Colour rejection saturation', '30', 0, 255, 1, 'Pixels above this HSV saturation are treated as coloured background. Lower values are stricter.'],
-    'bg_max_colored_coverage' => ['Maximum coloured coverage (%)', '5', 0, 100, 0.01, 'Maximum allowed coloured background coverage (default 5% allows minor edge artifacts).'],
-    'bg_border_fraction' => ['Border region to inspect (fraction)', '0.12', 0.03, 0.30, 0.01, 'Outer image fraction sampled as background; the detected subject area is excluded.'],
+
+// Available background strictness levels
+$backgroundStrictnessLevels = [
+    'strict' => [
+        'label' => 'Strict',
+        'desc' => 'Pure studio white only. International passport / NYSC standard.',
+    ],
+    'standard' => [
+        'label' => 'Standard',
+        'desc' => 'Recommended. Light-grey walls, warm/cool room lighting and mild shadows are accepted.',
+    ],
+    'relaxed' => [
+        'label' => 'Relaxed',
+        'desc' => 'Wider tolerance for home-taken photos with imperfect lighting.',
+    ],
+    'accept_all' => [
+        'label' => 'Accept All',
+        'desc' => 'Any background except dark or strongly coloured ones. Portal-avatar use only.',
+    ],
 ];
 
 $blurPolicyFields = [
@@ -32,14 +39,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         set_setting('python_service_url', trim($_POST['python_service_url'] ?? 'http://127.0.0.1:5001'));
         $minCriteria = max(1, (int)($_POST['min_pass_criteria'] ?? 4));
         set_setting('min_pass_criteria', (string)$minCriteria);
-        foreach ($whiteBackgroundFields as $key => [, $default, $min, $max]) {
-            $value = filter_var($_POST[$key] ?? null, FILTER_VALIDATE_FLOAT);
-            if ($value === false) {
-                $value = (float)$default;
-            }
-            $value = min((float)$max, max((float)$min, (float)$value));
-            set_setting($key, (string)$value);
-        }
+
+        // Save background strictness level
+        $strictnessInput = $_POST['background_strictness'] ?? 'standard';
+        $strictness = array_key_exists($strictnessInput, $backgroundStrictnessLevels)
+            ? $strictnessInput
+            : 'standard';
+        set_setting('background_strictness', $strictness);
+
+        // Save near-white acceptance toggle
+        $nearWhite = isset($_POST['background_near_white_acceptance']) ? '1' : '0';
+        set_setting('background_near_white_acceptance', $nearWhite);
+
         foreach ($blurPolicyFields as $key => [, $default, $min, $max]) {
             $value = filter_var($_POST[$key] ?? null, FILTER_VALIDATE_FLOAT);
             if ($value === false) {
@@ -78,10 +89,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $uniName = get_setting('university_name');
 $serviceUrl = get_setting('python_service_url');
 $minPassCriteria = get_setting('min_pass_criteria', '4');
-$whiteBackgroundValues = [];
-foreach ($whiteBackgroundFields as $key => [, $default]) {
-    $whiteBackgroundValues[$key] = get_setting($key, $default);
-}
+
+// Single authoritative read of the two background-validation controls.
+$verificationSettings = get_verification_settings();
+$backgroundStrictness = $verificationSettings['strictness'];
+$nearWhiteAcceptance = $verificationSettings['near_white_acceptance'];
+
+// The toggle displays the EFFECTIVE state: while nothing has been saved yet
+// the stored value is 'auto', meaning "follow the strictness level"
+// (off on Strict, on everywhere else). Saving the form pins an explicit
+// ON/OFF choice.
+$nearWhiteEffective = $nearWhiteAcceptance === 'auto'
+    ? ($backgroundStrictness !== 'strict')
+    : ($nearWhiteAcceptance === '1');
+
 $blurPolicyValues = [];
 foreach ($blurPolicyFields as $key => [, $default]) {
     $blurPolicyValues[$key] = get_setting($key, $default);
@@ -111,7 +132,7 @@ include __DIR__ . '/../includes/header.php';
   <div class="grid-2">
     <div class="card panel">
       <h3 class="section-title">System Settings</h3>
-      <p class="section-desc">Configure the display name, verification URL, minimum pass criteria threshold, and strict white-background limits.</p>
+      <p class="section-desc">Configure the display name, verification URL, minimum pass criteria threshold, and white-background validation.</p>
       <form method="POST">
         <input type="hidden" name="action" value="update_settings">
         <div class="field">
@@ -129,26 +150,63 @@ include __DIR__ . '/../includes/header.php';
             If 4 or more criteria are enabled by admin, a photo passes if it satisfies at least this many criteria (default: 4).
           </span>
         </div>
-        <h4 class="section-title" style="margin-top:28px; font-size:16px;">Strict White Background</h4>
-        <p class="section-desc">These values are sent to the verification service for every request. The default requires at least 70% visible white background and rejects visible dark, black, or coloured background.</p>
-        <?php foreach ($whiteBackgroundFields as $key => [$label, $default, $min, $max, $step, $help]): ?>
-          <div class="field">
-            <label><?= htmlspecialchars($label) ?></label>
-            <input type="number" name="<?= htmlspecialchars($key) ?>" value="<?= htmlspecialchars($whiteBackgroundValues[$key]) ?>"
-                   min="<?= htmlspecialchars((string)$min) ?>" max="<?= htmlspecialchars((string)$max) ?>" step="<?= htmlspecialchars((string)$step) ?>" required>
-            <span style="font-size:12px; color:var(--ink-500); display:block; margin-top:4px;"><?= htmlspecialchars($help) ?></span>
+
+        <h4 class="section-title" style="margin-top:28px; font-size:16px;">White Background Validation</h4>
+        <p class="section-desc">Two controls define how the background of a submitted photo is judged. The strictness level sets how tolerant the image analysis is; the near-white toggle decides whether slightly tinted off-white backgrounds are acceptable.</p>
+
+        <div class="field">
+          <label>White Background Strictness Level</label>
+          <div style="display:flex; flex-direction:column; gap:8px; margin-top:4px;">
+            <?php foreach ($backgroundStrictnessLevels as $levelKey => $level): ?>
+              <label style="display:flex; align-items:flex-start; gap:10px; padding:10px 12px; border:1px solid <?= $backgroundStrictness === $levelKey ? 'var(--accent, #7aa2ff)' : 'var(--navy-600)' ?>; border-radius:var(--radius-sm); cursor:pointer;<?= $backgroundStrictness === $levelKey ? ' background:rgba(122,162,255,0.08);' : '' ?>">
+                <input type="radio" name="background_strictness" value="<?= htmlspecialchars($levelKey) ?>"<?= $backgroundStrictness === $levelKey ? ' checked' : '' ?> required style="margin-top:2px;">
+                <span>
+                  <strong style="font-size:13px;"><?= htmlspecialchars($level['label']) ?></strong>
+                  <span style="display:block; font-size:12px; color:var(--ink-500); margin-top:2px;"><?= htmlspecialchars($level['desc']) ?></span>
+                </span>
+              </label>
+            <?php endforeach; ?>
           </div>
-        <?php endforeach; ?>
-        <h4 class="section-title" style="margin-top:28px; font-size:16px;">Sharpness / Blur Quality Policy</h4>
-        <p class="section-desc">Controls how sharpness (blur) is evaluated relative to background whiteness. When soft-fail is enabled, moderately blurred photos with a confirmed white background can still pass instead of being rejected.</p>
-        <?php foreach ($blurPolicyFields as $key => [$label, $default, $min, $max, $step, $help]): ?>
-          <div class="field">
-            <label><?= htmlspecialchars($label) ?></label>
-            <input type="number" name="<?= htmlspecialchars($key) ?>" value="<?= htmlspecialchars($blurPolicyValues[$key]) ?>"
-                   min="<?= htmlspecialchars((string)$min) ?>" max="<?= htmlspecialchars((string)$max) ?>" step="<?= htmlspecialchars((string)$step) ?>" required>
-            <span style="font-size:12px; color:var(--ink-500); display:block; margin-top:4px;"><?= htmlspecialchars($help) ?></span>
+          <span style="font-size:12px; color:var(--ink-500); display:block; margin-top:6px;">
+            The level automatically configures every internal threshold used by the image analysis engine — brightness, colour-neutrality, coverage and shadow limits. Dark or strongly coloured backgrounds are rejected at every level.
+          </span>
+        </div>
+
+        <div class="field" style="margin-top:16px;">
+          <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
+            <input type="checkbox" name="background_near_white_acceptance" value="1"<?= $nearWhiteEffective ? ' checked' : '' ?> style="width:18px; height:18px;">
+            <span>
+              <strong style="font-size:13px;">Near-White Background Acceptance</strong>
+              <span style="display:block; font-size:12px; color:var(--ink-500); margin-top:2px;">
+                ON — bright, almost colourless backgrounds photographed under real-world lighting (slightly dimmed or warm/cool-tinted white walls, light-grey studio backdrops) are accepted. OFF — only pure white qualifies.<?= $nearWhiteAcceptance === 'auto' ? ' Currently following the strictness level default.' : '' ?>
+              </span>
+            </span>
+          </label>
+          <span style="font-size:12px; color:var(--ink-500); display:block; margin-top:6px;">
+            Beige, cream, blue, green and dark backgrounds are always rejected regardless of this toggle.
+          </span>
+        </div>
+
+        <details style="margin-top:16px; border:1px solid var(--navy-600); border-radius:var(--radius-sm); padding:0;">
+          <summary style="cursor:pointer; padding:12px 16px; font-size:13px; font-weight:600; color:var(--ink-300); user-select:none; list-style:none; display:flex; align-items:center; gap:8px;">
+            <span style="display:inline-block; transition:transform 0.2s; font-size:10px;" class="adv-arrow">▶</span>
+            Sharpness / Blur Quality Policy
+          </summary>
+          <div style="padding:4px 16px 16px; border-top:1px solid var(--navy-700);">
+            <p style="font-size:12px; color:var(--ink-500); margin:8px 0 14px;">Controls how sharpness (blur) is evaluated relative to background whiteness. When soft-fail is enabled, moderately blurred photos with a confirmed white background can still pass instead of being rejected.</p>
+            <?php foreach ($blurPolicyFields as $key => [$label, $default, $min, $max, $step, $help]): ?>
+              <div class="field">
+                <label><?= htmlspecialchars($label) ?></label>
+                <input type="number" name="<?= htmlspecialchars($key) ?>" value="<?= htmlspecialchars($blurPolicyValues[$key]) ?>"
+                       min="<?= htmlspecialchars((string)$min) ?>" max="<?= htmlspecialchars((string)$max) ?>" step="<?= htmlspecialchars((string)$step) ?>" required>
+                <span style="font-size:12px; color:var(--ink-500); display:block; margin-top:4px;"><?= htmlspecialchars($help) ?></span>
+              </div>
+            <?php endforeach; ?>
           </div>
-        <?php endforeach; ?>
+        </details>
+        <style>
+          details[open] .adv-arrow { transform: rotate(90deg); }
+        </style>
         <button type="submit" class="btn btn-primary btn-full">Save Settings</button>
       </form>
     </div>

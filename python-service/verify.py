@@ -140,14 +140,12 @@ def _detect_faces(bgr):
                             "keypoints": det.location_data.relative_keypoints
                         })
         except Exception:
-            # MediaPipe can be installed but unavailable on a headless server
-            # (for example, when its OpenGL service cannot initialize). A
-            # validation request must still receive a deterministic response.
+            # Fall back to Haar cascades if MediaPipe fails to initialize
             mediapipe_failed = True
             MEDIAPIPE_AVAILABLE = False
 
     if not MEDIAPIPE_AVAILABLE or mediapipe_failed:
-        # CPU-only fallback when MediaPipe is missing or cannot initialize.
+        # Haar cascade fallback
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
         detections = _HAAR_FACE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60))
@@ -377,18 +375,21 @@ def check_glasses(bgr, faces, params):
     return {"passed": True, "message": "No eyeglasses detected.", "meta": meta}
 
 
+# Default white-background threshold fallbacks
 DEFAULT_WHITE_BACKGROUND_PARAMS = {
-    # Administrators can tighten or relax these defaults in Settings. The
-    # default accepts a photo when at least 30% of its visible background is
-    # acceptable white under real-world mobile-camera conditions.
+    # Tier 1: pure studio white
     "bg_min_value": 235.0,
     "bg_max_saturation": 18.0,
     "bg_max_delta_e": 10.0,
+    # Tier 2: near-white
+    "bg_near_white_enabled": 0.0,
+    "bg_near_white_min_l_star": 93.0,
+    "bg_near_white_max_chroma": 10.0,
+    "bg_near_white_max_b_star": 9.0,
+    # Coverage & uniformity thresholds
     "bg_min_white_coverage": 30.0,
     "bg_max_nonwhite_component_coverage": 30.0,
     "bg_max_luminance_range": 100.0,
-    # Dark/black and chromatic background are separate guards with 5% peripheral tolerance
-    # to avoid false rejections on stray hair or bezel anti-aliasing.
     "bg_reject_dark_value": 210.0,
     "bg_max_dark_coverage": 5.0,
     "bg_reject_colored_saturation": 30.0,
@@ -397,14 +398,131 @@ DEFAULT_WHITE_BACKGROUND_PARAMS = {
 }
 
 
-def _white_bg_param(params, key, minimum, maximum):
-    """Read an administrator setting defensively without allowing invalid API input."""
+# Strictness level presets for background validation
+BACKGROUND_STRICTNESS_LEVELS = {
+    "strict": {
+        "bg_min_value": 235.0,
+        "bg_max_saturation": 18.0,
+        "bg_max_delta_e": 10.0,
+        "bg_near_white_enabled": 0.0,
+        "bg_near_white_min_l_star": 93.0,
+        "bg_near_white_max_chroma": 10.0,
+        "bg_near_white_max_b_star": 9.0,
+        "bg_min_white_coverage": 30.0,
+        "bg_max_nonwhite_component_coverage": 30.0,
+        "bg_max_luminance_range": 100.0,
+        "bg_reject_dark_value": 210.0,
+        "bg_max_dark_coverage": 5.0,
+        "bg_reject_colored_saturation": 30.0,
+        "bg_max_colored_coverage": 5.0,
+        "bg_border_fraction": 0.12,
+    },
+    "standard": {
+        # Balanced lighting tolerance for indoor white walls
+        "bg_min_value": 150.0,
+        "bg_max_saturation": 25.0,
+        "bg_max_delta_e": 38.0,
+        "bg_near_white_enabled": 1.0,
+        "bg_near_white_min_l_star": 60.0,
+        "bg_near_white_max_chroma": 13.0,
+        "bg_near_white_max_b_star": 13.0,
+        "bg_min_white_coverage": 60.0,
+        "bg_max_nonwhite_component_coverage": 30.0,
+        "bg_max_luminance_range": 130.0,
+        "bg_reject_dark_value": 120.0,
+        "bg_max_dark_coverage": 8.0,
+        "bg_reject_colored_saturation": 36.0,
+        "bg_max_colored_coverage": 5.0,
+        "bg_border_fraction": 0.12,
+    },
+    "relaxed": {
+        # Relaxed thresholds for home-taken photos
+        "bg_min_value": 135.0,
+        "bg_max_saturation": 28.0,
+        "bg_max_delta_e": 44.0,
+        "bg_near_white_enabled": 1.0,
+        "bg_near_white_min_l_star": 52.0,
+        "bg_near_white_max_chroma": 13.0,
+        "bg_near_white_max_b_star": 13.0,
+        "bg_min_white_coverage": 50.0,
+        "bg_max_nonwhite_component_coverage": 40.0,
+        "bg_max_luminance_range": 160.0,
+        "bg_reject_dark_value": 105.0,
+        "bg_max_dark_coverage": 12.0,
+        "bg_reject_colored_saturation": 38.0,
+        "bg_max_colored_coverage": 5.0,
+        "bg_border_fraction": 0.12,
+    },
+    "accept_all": {
+        # Only rejects dark or vividly colored backgrounds
+        "bg_min_value": 110.0,
+        "bg_max_saturation": 80.0,
+        "bg_max_delta_e": 45.0,
+        "bg_near_white_enabled": 1.0,
+        "bg_near_white_min_l_star": 80.0,
+        "bg_near_white_max_chroma": 30.0,
+        "bg_near_white_max_b_star": 28.0,
+        "bg_min_white_coverage": 5.0,
+        "bg_max_nonwhite_component_coverage": 80.0,
+        "bg_max_luminance_range": 200.0,
+        "bg_reject_dark_value": 100.0,
+        "bg_max_dark_coverage": 20.0,
+        "bg_reject_colored_saturation": 80.0,
+        "bg_max_colored_coverage": 20.0,
+        "bg_border_fraction": 0.12,
+    },
+}
+
+
+# Canonical values for the near-white acceptance switch
+NEAR_WHITE_ACCEPTANCE_VALUES = ("auto", "1", "0")
+
+
+def _resolve_background_params(params):
+    """Resolve and merge background strictness preset parameters."""
+    level = str(params.get("background_strictness", "standard")).strip().lower()
+    if level not in BACKGROUND_STRICTNESS_LEVELS:
+        level = "standard"
+    preset = BACKGROUND_STRICTNESS_LEVELS[level]
+
+    merged = dict(preset)
+    merged["background_strictness"] = level
+
+    raw_switch = params.get(
+        "background_near_white_acceptance",
+        params.get("bg_near_white_enabled", "auto"),
+    )
+    if isinstance(raw_switch, bool):
+        switch = "1" if raw_switch else "0"
+    elif isinstance(raw_switch, (int, float)):
+        # Numeric 0/0.0 -> off, any non-zero number -> on (never "auto").
+        switch = "1" if float(raw_switch) != 0.0 else "0"
+    else:
+        switch = str(raw_switch).strip().lower() or "auto"
+        if switch not in NEAR_WHITE_ACCEPTANCE_VALUES:
+            switch = "auto"
+    merged["bg_near_white_enabled"] = 1.0 if switch == "1" else 0.0 if switch == "0" \
+        else float(preset["bg_near_white_enabled"])
+    merged["background_near_white_acceptance"] = switch
+
+    return merged
+
+
+def _white_bg_param(params, key):
+    """Read a preset-supplied background parameter defensively.
+
+    Values come exclusively from ``_resolve_background_params`` (level presets
+    are trusted code constants), but this keeps malformed runtime input from
+    ever producing NaN/inf thresholds.
+    """
     default = DEFAULT_WHITE_BACKGROUND_PARAMS[key]
     try:
         value = float(params.get(key, default))
+        if not np.isfinite(value):
+            value = default
     except (TypeError, ValueError):
         value = default
-    return min(maximum, max(minimum, value))
+    return value
 
 
 def _background_border_mask(shape, faces, border_fraction):
@@ -433,19 +551,16 @@ def _background_border_mask(shape, faces, border_fraction):
             valid_faces.append((fx, fy, fw, fh))
 
     if not valid_faces:
-        # With no detected portrait, all four borders are candidate background.
-        mask[h - border_y:, :] = 1
+        # Sample the top border and upper side strips when no face is found
+        upper_side_limit = max(1, int(h * 0.40))
+        mask[:upper_side_limit, :border_x] = 1
+        mask[:upper_side_limit, w - border_x:] = 1
+    else:
+        # Sample the side borders along the frame height
         mask[:, :border_x] = 1
         mask[:, w - border_x:] = 1
-    else:
-        # In passport-style portraits, shoulders or arms can extend to the side edges.
-        # Restrict candidate background to upper border and upper side bands above head line.
-        side_bottom = min(border_y, max(1, min(fy for _, fy, _, _ in valid_faces)))
-        if side_bottom > 0:
-            mask[:side_bottom, :border_x] = 1
-            mask[:side_bottom, w - border_x:] = 1
 
-    # Inset extreme 4 corners (1.5% of dimension) to avoid phone screenshot rounded corners/bezels
+    # Inset corners to avoid rounded corners/bezels
     corner_inset = max(3, int(min(w, h) * 0.015))
     mask[:corner_inset, :corner_inset] = 0
     mask[:corner_inset, w - corner_inset:] = 0
@@ -477,7 +592,7 @@ def _background_border_mask(shape, faces, border_fraction):
             ], dtype=np.int32)
             cv2.fillConvexPoly(subject_mask, torso, 1)
 
-        # Scale-adaptive transition margin dilation for low-res / blur edge isolation
+        # Dilate subject mask to prevent border edge bleeding
         margin = max(2, int(round(min(w, h) * 0.015)))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
         dilated_subject = cv2.dilate(subject_mask, kernel)
@@ -490,8 +605,6 @@ def _largest_component_coverage(binary_mask, sample_mask, sample_count):
     """Measure the largest contiguous contaminated background region."""
     if sample_count == 0 or not np.any(binary_mask):
         return 0.0
-    # Restrict components to the sample region: a contamination cannot bridge
-    # through the excluded subject mask.
     component_input = np.where(sample_mask, binary_mask, 0).astype(np.uint8)
     count, _, stats, _ = cv2.connectedComponentsWithStats(component_input, connectivity=8)
     if count <= 1:
@@ -501,7 +614,7 @@ def _largest_component_coverage(binary_mask, sample_mask, sample_count):
 
 
 def _measure_sharpness(bgr, faces):
-    """Compute face-ROI Laplacian variance. Returns the scalar sharpness value."""
+    """Compute face-ROI Laplacian variance."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     if faces:
         f = faces[0]
@@ -519,41 +632,34 @@ def _measure_sharpness(bgr, faces):
 
 
 def check_white_background(bgr, faces, params):
-    """Strict, configurable white-background verification.
-
-    A background pixel must satisfy all administrator-controlled brightness,
-    saturation, and CIE-LAB distance limits. The decision evaluates total white
-    coverage, largest contiguous non-white component, dark coverage, colored
-    coverage, and luminance range, which catches small colour marks, shadows,
-    and gradients.
-
-    Sharpness and brightness are evaluated independently and do not override
-    or artificially distort white-background validation. Fast edge-preserving
-    spatial filtering is applied to eliminate CMOS sensor noise and compression
-    ringing artifacts on mobile cameras.
-    """
+    """Verifies that the background is white and uniform against preset thresholds."""
     if bgr is None or not isinstance(bgr, np.ndarray) or bgr.ndim != 3:
         return {"passed": False, "message": "Invalid image data.", "meta": {}}
     h, w = bgr.shape[:2]
     if h < 2 or w < 2:
         return {"passed": False, "message": "Invalid image dimensions.", "meta": {}}
 
-    min_value = _white_bg_param(params, "bg_min_value", 0, 255)
-    max_saturation = _white_bg_param(params, "bg_max_saturation", 0, 255)
-    max_delta_e = _white_bg_param(params, "bg_max_delta_e", 0, 150)
-    min_white_coverage = _white_bg_param(params, "bg_min_white_coverage", 0, 100)
-    max_component_coverage = _white_bg_param(params, "bg_max_nonwhite_component_coverage", 0, 100)
-    max_luminance_range = _white_bg_param(params, "bg_max_luminance_range", 0, 100)
-    reject_dark_value = _white_bg_param(params, "bg_reject_dark_value", 0, 255)
-    max_dark_coverage = _white_bg_param(params, "bg_max_dark_coverage", 0, 100)
-    reject_colored_saturation = _white_bg_param(params, "bg_reject_colored_saturation", 0, 255)
-    max_colored_coverage = _white_bg_param(params, "bg_max_colored_coverage", 0, 100)
-    border_fraction = _white_bg_param(params, "bg_border_fraction", 0.03, 0.30)
+    params = _resolve_background_params(params)
+
+    min_value = _white_bg_param(params, "bg_min_value")
+    max_saturation = _white_bg_param(params, "bg_max_saturation")
+    max_delta_e = _white_bg_param(params, "bg_max_delta_e")
+    near_white_enabled = _white_bg_param(params, "bg_near_white_enabled") >= 0.5
+    near_white_min_l_star = _white_bg_param(params, "bg_near_white_min_l_star")
+    near_white_max_chroma = _white_bg_param(params, "bg_near_white_max_chroma")
+    near_white_max_b_star = _white_bg_param(params, "bg_near_white_max_b_star")
+    min_white_coverage = _white_bg_param(params, "bg_min_white_coverage")
+    max_component_coverage = _white_bg_param(params, "bg_max_nonwhite_component_coverage")
+    max_luminance_range = _white_bg_param(params, "bg_max_luminance_range")
+    reject_dark_value = _white_bg_param(params, "bg_reject_dark_value")
+    max_dark_coverage = _white_bg_param(params, "bg_max_dark_coverage")
+    reject_colored_saturation = _white_bg_param(params, "bg_reject_colored_saturation")
+    max_colored_coverage = _white_bg_param(params, "bg_max_colored_coverage")
+    border_fraction = min(0.30, max(0.03, _white_bg_param(params, "bg_border_fraction")))
 
     sample_mask = _background_border_mask((h, w), faces, border_fraction).astype(bool)
 
     if bgr.ndim == 3 and bgr.shape[2] == 4:
-        # If alpha channel is available, exclude subject foreground (alpha >= 25)
         alpha_chan = bgr[:, :, 3]
         bgr = bgr[:, :, :3]
         sample_mask = sample_mask & (alpha_chan < 25)
@@ -562,11 +668,11 @@ def check_white_background(bgr, faces, params):
     if sample_count < 32:
         return {
             "passed": False,
-            "message": "Could not find enough visible background to verify a white background.",
-            "meta": {"sampled_pixels": sample_count, "minimum_sampled_pixels": 32},
+            "message": "White background not accepted, please try again.",
+            "meta": {"sampled_pixels": sample_count, "minimum_sampled_pixels": 32, "issues": ["Could not find enough visible background to verify a white background."]},
         }
 
-    # Fast edge-preserving spatial denoising to handle sensor noise and compression artifacts
+    # Median filter to reduce sensor noise
     ksize = 3 if min(w, h) < 600 else 5
     denoised_bgr = cv2.medianBlur(bgr, ksize)
 
@@ -580,29 +686,38 @@ def check_white_background(bgr, faces, params):
     a = lab[:, :, 1]
     b = lab[:, :, 2]
 
-    # Delta E in CIE-LAB to pure white (100, 0, 0)
     delta_e = np.sqrt((100.0 - L) ** 2 + a ** 2 + b ** 2)
 
+    # Tier 1: Pure white check
+    tier_pure = (value >= min_value) & (saturation <= max_saturation) & (delta_e <= max_delta_e)
+
+    # Tier 2: Near-white check for realistic lighting
+    if near_white_enabled:
+        chroma = np.sqrt(a.astype(np.float32) ** 2 + b.astype(np.float32) ** 2)
+        tier_near_white = (
+            (L >= near_white_min_l_star)
+            & (chroma <= near_white_max_chroma)
+            & (np.abs(b) <= near_white_max_b_star)
+        )
+    else:
+        tier_near_white = np.zeros(value.shape, dtype=bool)
+
+    white_pixels = (tier_pure | tier_near_white) & sample_mask
+
+    # Pure studio white probe for metadata reporting
     pure_white_pixels = (value >= 235) & (saturation <= 20) & (delta_e <= 12) & sample_mask
     pure_white_count = int(np.count_nonzero(pure_white_pixels))
 
-    # If studio pure white background covers >= 65% of the sample in a detected portrait,
-    # evaluate background metrics specifically on pure white studio region (ignoring subject perimeter spillage).
-    if sample_count >= 32 and faces and (pure_white_count / float(sample_count)) >= 0.65:
-        eval_mask = pure_white_pixels
-    else:
-        eval_mask = sample_mask
+    nonwhite_mask = (~white_pixels) & sample_mask
 
-    nonwhite_mask = (
-        (value < min_value)
-        | (saturation > max_saturation)
-        | (delta_e > max_delta_e)
-    ) & eval_mask
-
-    # Dark pixels threshold: truly dark/black pixels (value < 140)
+    # Identify dark and colored pixels in sampled background
     effective_dark_cutoff = min(140.0, reject_dark_value)
-    dark_mask = (value < effective_dark_cutoff) & eval_mask
-    colored_mask = (saturation > reject_colored_saturation) & eval_mask
+    dark_mask = (value < effective_dark_cutoff) & sample_mask
+    colored_mask = (
+        (saturation > reject_colored_saturation)
+        & (value >= effective_dark_cutoff)
+        & sample_mask
+    )
 
     sampled_value = value[sample_mask]
     sampled_saturation = saturation[sample_mask]
@@ -612,11 +727,13 @@ def check_white_background(bgr, faces, params):
     nonwhite_count = int(np.count_nonzero(nonwhite_mask))
     nonwhite_coverage = nonwhite_count / float(sample_count) * 100.0
     white_coverage = 100.0 - nonwhite_coverage
+    near_white_count = int(np.count_nonzero(tier_near_white & sample_mask & ~tier_pure))
+    near_white_coverage = near_white_count / float(sample_count) * 100.0
 
     component_coverage = _largest_component_coverage(nonwhite_mask, sample_mask, sample_count) * 100.0
     dark_coverage = float(np.count_nonzero(dark_mask)) / float(sample_count) * 100.0
     colored_coverage = float(np.count_nonzero(colored_mask)) / float(sample_count) * 100.0
-    luminance_range = float(np.percentile(sampled_L, 95) - np.percentile(sampled_L, 5))
+    luminance_range = float(np.percentile(sampled_L, 90) - np.percentile(sampled_L, 10))
 
     issues = []
     if white_coverage < min_white_coverage:
@@ -645,6 +762,10 @@ def check_white_background(bgr, faces, params):
         "min_value": min_value,
         "max_saturation": max_saturation,
         "max_delta_e": max_delta_e,
+        "near_white_enabled": bool(near_white_enabled),
+        "near_white_min_l_star": near_white_min_l_star,
+        "near_white_max_chroma": near_white_max_chroma,
+        "near_white_max_b_star": near_white_max_b_star,
         "min_white_coverage_percent": min_white_coverage,
         "max_nonwhite_component_coverage_percent": max_component_coverage,
         "max_luminance_range_l_star": max_luminance_range,
@@ -653,16 +774,26 @@ def check_white_background(bgr, faces, params):
         "reject_colored_saturation": reject_colored_saturation,
         "max_colored_coverage_percent": max_colored_coverage,
         "border_fraction": border_fraction,
+        "luminance_range_percentiles": [10, 90],
         "blur_tolerance_applied": False,
+        "background_strictness": params.get("background_strictness", "standard"),
+        "background_near_white_acceptance": params.get(
+            "background_near_white_acceptance", "auto"
+        ),
     }
     meta = {
         "sampled_pixels": sample_count,
         "white_coverage_percent": round(white_coverage, 3),
+        "pure_white_coverage_percent": round(pure_white_count / float(sample_count) * 100.0, 3),
+        "near_white_coverage_percent": round(near_white_coverage, 3),
         "nonwhite_coverage_percent": round(nonwhite_coverage, 3),
         "largest_nonwhite_component_percent": round(component_coverage, 3),
         "dark_coverage_percent": round(dark_coverage, 3),
         "colored_coverage_percent": round(colored_coverage, 3),
         "mean_value": round(float(np.mean(sampled_value)), 3),
+        "mean_l_star": round(float(np.mean(sampled_L)), 3),
+        "p10_l_star": round(float(np.percentile(sampled_L, 10)), 3),
+        "p90_l_star": round(float(np.percentile(sampled_L, 90)), 3),
         "max_saturation_detected": round(float(np.max(sampled_saturation)), 3),
         "mean_delta_e_to_white": round(float(np.mean(sampled_delta_e)), 3),
         "max_delta_e_to_white": round(float(np.max(sampled_delta_e)), 3),
@@ -671,8 +802,9 @@ def check_white_background(bgr, faces, params):
         "thresholds": thresholds,
     }
     if not issues:
-        return {"passed": True, "message": "Background meets the configured white-background criteria.", "meta": meta}
-    return {"passed": False, "message": " ".join(issues), "meta": meta}
+        return {"passed": True, "message": "White bg accepted.", "meta": meta}
+    meta["issues"] = issues
+    return {"passed": False, "message": "White background not accepted, please try again.", "meta": meta}
 
 
 _logger = logging.getLogger(__name__)
@@ -680,9 +812,7 @@ _logger = logging.getLogger(__name__)
 # Cached estimator instance — created once per worker.
 _upper_body_estimator = UpperBodyVisibilityEstimator()
 
-# Used only by tests and explicitly injected detector adapters.  Real
-# TorchTieDetector instances receive the equivalent values from the immutable,
-# calibrated model policy loaded in get_tie_detector().
+# Geometry ranges for tie validation
 _TEST_TIE_GEOMETRY = {
     "min_width_face_ratio": 0.04,
     "max_width_face_ratio": 0.85,
@@ -695,12 +825,7 @@ _TEST_TIE_GEOMETRY = {
 
 
 def _tie_positive_policy(detector, params):
-    """Return the calibrated positive decision rule for a detector.
-
-    A loaded TorchTieDetector must have a TieModelPolicy.  The fallback keeps
-    the lightweight fake-detector unit tests backwards compatible; it is not
-    reachable by a model loaded through get_tie_detector().
-    """
+    """Return positive decision thresholds and geometry policy for tie detector."""
     policy = getattr(detector, "policy", None)
     if isinstance(policy, TieModelPolicy):
         return policy.positive_threshold, policy.geometry, policy.model_version
@@ -858,12 +983,33 @@ def _analyze_tie_cv(bgr, faces):
         if lower_spread > upper_spread * 1.4 and lower_spread > 8.0:
             diverging_edges = True
 
+    # 6. Bilateral contrast symmetry: a real tie creates roughly equal
+    #    contrast on both sides of the center strip.  A zipper, collar fold
+    #    or button line often produces asymmetric contrast.  High asymmetry
+    #    reduces confidence.
+    bilateral_symmetry = 1.0 - abs(contrast_left - contrast_right) / max(1.0, max(contrast_left, contrast_right))
+
+    # 7. Color-uniformity rejection: if the central strip has very low color
+    #    variance (same fabric colour as the flanks, e.g. a zipper on a
+    #    monochrome jacket) the contrast comes only from texture/edges, not
+    #    a distinct tie blade colour.  Convert to LAB and check chroma in the
+    #    center vs flanks.
+    c_lab = cv2.cvtColor(c_strip, cv2.COLOR_BGR2LAB).astype(np.float32)
+    c_chroma = float(np.mean(np.sqrt(c_lab[:, :, 1] ** 2 + c_lab[:, :, 2] ** 2)))
+    l_lab = cv2.cvtColor(l_strip, cv2.COLOR_BGR2LAB).astype(np.float32)
+    r_lab = cv2.cvtColor(r_strip, cv2.COLOR_BGR2LAB).astype(np.float32)
+    flanks_chroma = (float(np.mean(np.sqrt(l_lab[:, :, 1] ** 2 + l_lab[:, :, 2] ** 2))) +
+                     float(np.mean(np.sqrt(r_lab[:, :, 1] ** 2 + r_lab[:, :, 2] ** 2)))) / 2.0
+    chroma_diff = abs(c_chroma - flanks_chroma)
+
     # Build result dict
     result_meta = {
         "skin_frac": round(skin_frac, 3),
         "blade_contrast": round(blade_contrast, 2),
         "contrast_ratio": round(contrast_ratio, 2),
         "vert_edge_score": round(vert_edge_score, 2),
+        "bilateral_symmetry": round(bilateral_symmetry, 3),
+        "chroma_diff": round(chroma_diff, 2),
     }
 
     # Reject open collars / bare skin
@@ -872,22 +1018,54 @@ def _analyze_tie_cv(bgr, faces):
 
     # Reject plain solid shirt without tie (no central contrast, edges, or texture)
     max_flank_contrast = max(contrast_left, contrast_right)
-    if blade_contrast < 20.0 and max_flank_contrast < 22.0 and vert_edge_score < 0.30 and c_var < 15.0:
+    if blade_contrast < 25.0 and max_flank_contrast < 28.0 and vert_edge_score < 0.40 and c_var < 18.0:
         return {**result_meta, "has_tie": False, "reason": "solid_shirt_no_tie"}
 
     # Reject diverging-edge patterns (V-necklines, open collars with contrast)
-    if diverging_edges and blade_contrast < 40.0:
+    if diverging_edges and blade_contrast < 50.0:
         return {**result_meta, "has_tie": False, "reason": "v_neckline"}
 
-    # Tie presence rule
+    # Reject monochrome garment features (zippers, seams on same-colour
+    # fabric): if the center and flanks share similar chroma and the
+    # luminance-only blade contrast is moderate, it is not a tie.
+    if chroma_diff < 4.0 and blade_contrast < 45.0 and c_var < 22.0:
+        return {**result_meta, "has_tie": False, "reason": "monochrome_garment_feature"}
+
+    # Reject asymmetric contrast (button line, collar fold, single-side seam):
+    # a real tie produces roughly symmetric contrast on both flanks.
+    if bilateral_symmetry < 0.45 and blade_contrast < 50.0:
+        return {**result_meta, "has_tie": False, "reason": "asymmetric_contrast"}
+
+    # 8. Vertical luminance gradient in center column: a tie blade has
+    #    relatively uniform colour along its length, while a V-neckline
+    #    showing an undershirt creates a sharp dark→light (or vice versa)
+    #    transition.  Measure L* range between top and bottom thirds.
+    c_lab_l = c_lab[:, :, 0]  # L* channel of center strip (already computed)
+    c_rows = c_lab_l.shape[0]
+    vert_gradient = 0.0
+    if c_rows >= 6:
+        top_L = float(np.mean(c_lab_l[:c_rows // 3, :]))
+        bot_L = float(np.mean(c_lab_l[2 * c_rows // 3:, :]))
+        vert_gradient = abs(top_L - bot_L)
+    # A 40+ L* swing in the center column is an open collar / undershirt,
+    # not a uniform tie blade.  Combined with high c_var this is definitive.
+    if vert_gradient > 35.0 and c_var > 35.0 and blade_contrast < 55.0:
+        return {**result_meta, "has_tie": False, "reason": "v_neckline_luminance_gradient"}
+
+    # Tie presence rule — requires strong, multi-signal positive evidence.
+    # Thresholds raised from previous values (22→30, 0.30→0.45) to eliminate
+    # false positives on jacket zippers, collared shirts, and button lines.
+    # The c_var rule additionally requires a small vertical gradient to
+    # exclude V-neckline luminance transitions masquerading as tie texture.
     is_tie = (
         skin_frac <= 0.15
         and not diverging_edges
+        and bilateral_symmetry >= 0.45
         and (
-            (blade_contrast >= 22.0 and vert_edge_score >= 0.30) or
-            (max_flank_contrast >= 35.0 and vert_edge_score >= 0.30) or
-            (blade_contrast >= 20.0 and c_var >= 25.0) or
-            (blade_contrast >= 35.0 and contrast_ratio >= 1.10)
+            (blade_contrast >= 30.0 and vert_edge_score >= 0.45 and chroma_diff >= 3.0) or
+            (max_flank_contrast >= 45.0 and vert_edge_score >= 0.45) or
+            (blade_contrast >= 30.0 and c_var >= 28.0 and chroma_diff >= 3.0 and vert_gradient < 35.0) or
+            (blade_contrast >= 50.0 and contrast_ratio >= 1.30)
         )
     )
 
@@ -1463,13 +1641,7 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         if res.get("passed"):
             passed_count += 1
 
-    # ------------------------------------------------------------------
-    # Soft-blur conditional pass
-    # ------------------------------------------------------------------
-    # When the blur check produced a "soft" severity (below ideal threshold
-    # but above severe) AND the white-background check independently passed,
-    # promote the blur result to a conditional pass so it does not consume
-    # one of the limited pass slots and cause a cascade rejection.
+    # Blur soft-failure: if sharpness is slightly low but white background passed, allow conditional pass
     quality_notes = []
     blur_result = results.get("no_blur", {})
     bg_result = results.get("white_background", {})
@@ -1481,8 +1653,6 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         and blur_result.get("meta", {}).get("severity") == "soft"
         and blur_result.get("meta", {}).get("blur_soft_fail_enabled")
     ):
-        # Only promote when background is confirmed white (or bg check is
-        # not enabled — in that case there is no compliance gate to guard).
         bg_passed = bg_result.get("passed", True) if enabled_criteria.get("white_background") else True
         if bg_passed:
             passed_count += 1
@@ -1503,21 +1673,14 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         required_to_pass = min(min_required_param, total_criteria)
         overall_passed = (passed_count >= required_to_pass)
 
-        # "Strictly White Background" is an enabled compliance requirement,
-        # not an advisory score. Without this gate a photo could be marked
-        # approved despite the UI reporting a failed white-background check.
-        # Other criteria retain the portal's existing pass-count behaviour.
+        # Mandatory requirements: failing any of these blocks overall pass
         if enabled_criteria.get("white_background") and not bg_result.get("passed", False):
             overall_passed = False
 
-        # "No Necktie" is a hard compliance gate: tie detected, uncertain,
-        # or insufficient visibility must block automatic approval.
         no_tie_result = results.get("no_tie", {})
         if enabled_criteria.get("no_tie") and not no_tie_result.get("passed", False):
             overall_passed = False
 
-        # "Tie / Formal Neckwear Required" is a hard compliance gate:
-        # no tie detected, uncertain, or insufficient visibility must block automatic approval.
         require_tie_result = results.get("require_tie", {})
         if enabled_criteria.get("require_tie") and not require_tie_result.get("passed", False):
             overall_passed = False
@@ -1534,9 +1697,6 @@ def run_checks(image_bytes, enabled_criteria, params=None):
             "height": int(bgr.shape[0]),
             "faces_detected": len(faces)
         },
-        # Operational telemetry for the API response and submission audit log.
-        # It measures this process only; upload/network time is intentionally
-        # excluded so it remains useful across deployment environments.
         "timings_ms": {
             "image_decode": round((decoded_at - started_at) * 1000.0, 3),
             "face_detection": round((faces_detected_at - decoded_at) * 1000.0, 3),
