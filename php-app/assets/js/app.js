@@ -80,7 +80,12 @@
   startCameraBtn.addEventListener('click', async () => {
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 1600 } }
+        video: {
+          facingMode: 'user',
+          // width: { ideal: 1280 }, 
+          // height: { ideal: window.innerWidth < 500 ? 720 : 1280 },
+          height: { ideal: window.innerWidth < 500 ? 900 : 1600 }
+        }
       });
       cameraVideo.srcObject = cameraStream;
       cameraVideo.classList.remove('hidden');

@@ -17,7 +17,7 @@ from flask_cors import CORS
 from PIL import Image, ImageEnhance, ImageOps
 import cv2
 import numpy as np
-from verify import run_checks, CHECK_LABELS, _detect_faces
+from verify import run_checks, CHECK_LABELS, _detect_faces, get_tie_detector
 
 try:
     from rembg import new_session as rembg_new_session, remove as rembg_remove
@@ -53,6 +53,23 @@ def get_rembg_session():
                 REMBG_SESSION = None
     return REMBG_SESSION
 
+def _warm_all_models():
+    """Load both lazily-initialized ML models once so first requests are fast."""
+    result = {}
+    try:
+        get_tie_detector()
+        result["tie_detector_loaded"] = True
+    except Exception as exc:  # never let warm-up crash the caller
+        result["tie_detector_loaded"] = False
+        result["tie_detector_error"] = str(exc)[:200]
+    result["rembg_session_loaded"] = get_rembg_session() is not None
+    return result
+
+@app.route("/warmup", methods=["GET", "POST"])
+def warmup():
+    """Pre-load lazy ML models. Cheap/no-op when already warm."""
+    return jsonify({"status": "ok", **_warm_all_models()}
+)
 
 def get_subject_cutout(pil_img):
     """
@@ -456,4 +473,5 @@ def edit_photo():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
+    threading.Thread(target=_warm_all_models, name="model-warmup", daemon=True).start()
     app.run(host="127.0.0.1", port=port, debug=True)
