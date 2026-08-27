@@ -1681,8 +1681,12 @@ def run_checks(image_bytes, enabled_criteria, params=None):
             )
 
     total_criteria = len(ordered_keys)
-    min_required_param = int(params.get("min_pass_criteria", 4))
     strict_mode = bool(int(params.get("strict_all_criteria", 0)))
+
+    try:
+        min_required_param = max(0, int(params.get("min_pass_criteria", 4)))
+    except (TypeError, ValueError):
+        min_required_param = 4 
 
     # Failures hidden by the pass-count gate (F1): enabled checks that did not
     # pass but can be masked by enough other passing checks.  A soft-promoted
