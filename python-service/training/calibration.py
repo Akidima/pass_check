@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
-"""
-Confidence Calibration for Tie Detector
----------------------------------------
-Runs the trained tie detector over a validation set, collects raw scores,
-associates them with ground-truth labels, and selects optimal
-accept/reject thresholds based on operational cost requirements.
+"""Find optimal accept/reject confidence thresholds for the tie detector
+by evaluating cost-weighted error rates across a validation set.
 
-Usage::
-
-    python training/calibration.py \\
-        --model    models/tie_detector_v1.pt \\
-        --images   data/val/images \\
-        --json     data/val/annotations.json \\
-        --output   models/calibration_config.json \\
-        --device   cpu
-
-The final test set must remain untouched during threshold tuning.
-
-Production inference must **never** import this module.
+Example:
+    python training/calibration.py \
+        --model models/tie_detector_v1.pt \
+        --images data/val/images \
+        --json data/val/annotations.json \
+        --output models/calibration_config.json
 """
 
 from __future__ import annotations
@@ -54,13 +44,7 @@ def build_model(model_path: str, device: torch.device):
 
 @torch.no_grad()
 def collect_scores(model, data_loader, device):
-    """Collect raw detector scores associated with ground-truth labels.
-
-    Returns
-    -------
-    list of dict
-        Each entry: {"image_id", "has_tie", "max_score", "n_detections"}
-    """
+    """Run model over dataset and collect highest confidence tie score per image."""
     results = []
 
     for images, targets in data_loader:
@@ -93,24 +77,7 @@ def collect_scores(model, data_loader, device):
 def evaluate_thresholds(score_data, accept_threshold, reject_threshold,
                         false_reject_cost=1.0, false_accept_cost=1.0,
                         manual_review_cost=0.1):
-    """Evaluate a threshold pair on the collected score data.
-
-    Decision policy::
-
-        score >= reject_threshold  -> reject  (tie detected)
-        score <= accept_threshold  -> accept  (no tie)
-        otherwise                  -> manual_review
-
-    For images WITH a tie (has_tie=True):
-        - reject -> correct rejection
-        - accept -> false acceptance (BAD)
-        - manual_review -> safe but costly
-
-    For images WITHOUT a tie (has_tie=False):
-        - reject -> false rejection (BAD)
-        - accept -> correct acceptance
-        - manual_review -> safe but costly
-    """
+    """Compute total cost and breakdown for a given accept/reject threshold pair."""
     correct_rejections = 0
     false_acceptances = 0
     correct_acceptances = 0
@@ -166,10 +133,7 @@ def find_optimal_thresholds(score_data,
                             false_reject_cost=1.0,
                             false_accept_cost=1.0,
                             manual_review_cost=0.1):
-    """Grid search over threshold candidates to minimise operational cost.
-
-    Returns the best (accept_threshold, reject_threshold) pair.
-    """
+    """Grid search accept/reject candidates to find the threshold pair with lowest total cost."""
     candidates_accept = np.arange(0.05, 0.50, 0.05)
     candidates_reject = np.arange(0.50, 0.96, 0.05)
 
@@ -217,7 +181,7 @@ def main():
     print(f"Collecting scores for {len(dataset)} validation images...")
     score_data = collect_scores(model, loader, device)
 
-    # Distribution summary
+    # Score distribution summary
     tie_scores = [e["max_score"] for e in score_data if e["has_tie"]]
     no_tie_scores = [e["max_score"] for e in score_data if not e["has_tie"]]
     print(f"\nScore distribution:")
@@ -234,7 +198,7 @@ def main():
               f"min={np.min(no_tie_scores):.3f} "
               f"max={np.max(no_tie_scores):.3f}")
 
-    # Find optimal thresholds
+    # Search for optimal thresholds
     print(f"\nSearching thresholds with costs: "
           f"false_reject={args.false_reject_cost}, "
           f"false_accept={args.false_accept_cost}, "
@@ -255,7 +219,7 @@ def main():
     for k, v in best.items():
         print(f"  {k}: {v}")
 
-    # Save calibration config
+    # Save output config
     config = {
         "accept_threshold": best["accept_threshold"],
         "reject_threshold": best["reject_threshold"],
@@ -266,9 +230,8 @@ def main():
             "manual_review_cost": args.manual_review_cost,
         },
         "note": (
-            "These thresholds were selected on validation data. "
-            "The test set must remain untouched during tuning. "
-            "Re-run calibration after any model retraining."
+            "Thresholds calibrated on validation dataset. "
+            "Re-run calibration after model retraining."
         ),
     }
 
@@ -281,3 +244,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

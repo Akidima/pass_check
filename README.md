@@ -127,9 +127,11 @@ python-service/venv/bin/python python-service/benchmarks/benchmark_white_backgro
 ```
 
 The `/verify` JSON response also includes `timings_ms` for image decode, face
-detection, every enabled check, and total service-side processing. The optional
-U2-Net/rembg model is initialized lazily and cached only for `/edit-photo`, so
-it does not delay photo validation.
+detection, every enabled check, and total service-side processing. Both heavy
+models (tie detector, U2-Net/rembg) are pre-loaded in a background thread at
+service startup and can be warmed manually via `GET`/`POST /warmup`; a passing
+photo's stored copy is repainted via a synchronous `/edit-photo` call in
+`php-app/api/verify.php`, which is fast (<1 s) once models are warm.
 
 ## Setup & Run (Local / XAMPP-style)
 

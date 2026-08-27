@@ -10,6 +10,7 @@ Service listens on http://127.0.0.1:5001
 
 import io
 import json
+import logging
 import os
 import threading
 from flask import Flask, request, jsonify, send_file
@@ -17,7 +18,11 @@ from flask_cors import CORS
 from PIL import Image, ImageEnhance, ImageOps
 import cv2
 import numpy as np
+import hmac 
 from verify import run_checks, CHECK_LABELS, _detect_faces, get_tie_detector
+
+logger = logging.getLogger(__name__)
+
 
 try:
     from rembg import new_session as rembg_new_session, remove as rembg_remove
@@ -37,6 +42,18 @@ CORS(app)
 
 MAX_UPLOAD_MB = 12
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+PORTAL_SHARED_SECRET = os.environ.get("PORTAL_SHARED_SECRET")
+
+@app.before_request
+def require_service_auth():
+    if request.endpoint == "health":
+        return None
+    sent = request.headers.get("X-Service-Token", "")
+    if not PORTAL_SHARED_SECRET or not hmac.compare_digest(sent, PORTAL_SHARED_SECRET):
+        return jsonify({"error": "Forbidden", "code": "FORBIDDEN"}), 403
+    
+    CORS(app, origins=[os.environ.get("PORTAL_URL"), "https://localhost:8000"]) #Added https://localhost:8000 for testing
 
 
 def get_rembg_session():
@@ -85,8 +102,7 @@ def get_subject_cutout(pil_img):
         try:
             cutout_img = rembg_remove(pil_img_rgb, session=rembg_session)
         except Exception as e:
-            print(f"rembg_remove error: {e}")
-            pass
+            logger.exception("rembg_remove failed: %s", e)
 
     if cutout_img is not None:
         arr_rgba = np.array(cutout_img)
@@ -474,4 +490,6 @@ def edit_photo():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     threading.Thread(target=_warm_all_models, name="model-warmup", daemon=True).start()
-    app.run(host="127.0.0.1", port=port, debug=True)
+    # Dev convenience only; production must use gunicorn or similar WSGI server. 
+    # Flask's built-in server is not suitable for production.
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5001)), debug=False)

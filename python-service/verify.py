@@ -113,7 +113,7 @@ def _nms_faces(faces, h, w, iou_threshold=0.35, min_area_ratio=0.03):
     return keep
 
 
-def _detect_faces(bgr):
+def _detect_faces(bgr, meta_out: dict = None) -> list[dict]:
     """Return list of face detections with bounding boxes (relative + absolute).
     Uses mediapipe when available, otherwise falls back to OpenCV's Haar cascade.
     Applies NMS to filter out duplicate overlapping boxes and tiny false positives."""
@@ -139,7 +139,10 @@ def _detect_faces(bgr):
                             "score": float(det.score[0]) if det.score else 0.0,
                             "keypoints": det.location_data.relative_keypoints
                         })
+            if meta_out is not None:
+                meta_out["face_backend"] = "MediaPipe"
         except Exception:
+            logger.warning("MediaPipe failed; using Haar Cascade for this image.")
             # Fall back to Haar cascades if MediaPipe fails to initialize
             mediapipe_failed = True
             MEDIAPIPE_AVAILABLE = False
@@ -151,7 +154,8 @@ def _detect_faces(bgr):
         detections = _HAAR_FACE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60))
         for (x, y, fw, fh) in detections:
             faces.append({"x": int(x), "y": int(y), "w": int(fw), "h": int(fh), "score": 1.0, "keypoints": None})
-
+        if meta_out is not None:
+            meta_out["face_backend"] = "haar cascade"   
     return _nms_faces(faces, h, w)
 
 
@@ -921,23 +925,25 @@ def _analyze_tie_cv(bgr, faces):
 
     cw = chest_crop.shape[1]
 
-    # Central tie blade/knot column vs bilateral shirt flanks
+    # Split the chest crop into three vertical strips: the center (where a tie
+    # would be) and the left/right flanks (shirt or jacket fabric).
     c_strip = chest_crop[:, int(cw * 0.36):int(cw * 0.64)]
     l_strip = chest_crop[:, int(cw * 0.05):int(cw * 0.30)]
     r_strip = chest_crop[:, int(cw * 0.70):int(cw * 0.95)]
 
-    # 1. Skin presence in central column — subject-relative perceptual distance
-    #    (replaces the hard-coded a*>=132, b*>=130 warm-hue gate that only
-    #    worked for a narrow range of skin tones)
+    # How much visible skin is in the center strip? If we can see a lot of
+    # bare skin there, the person probably isn't wearing a tie. We measure
+    # closeness to the subject's own skin tone rather than hard-coded values
+    # so it works across all skin tones.
     skin_frac = 0.0
     if skin_lab_mean is not None and c_strip.size > 0:
         skin_dists = _compute_skin_distance(c_strip, skin_lab_mean)
         if skin_dists.size > 0:
-            # Pixels within perceptual distance 12 of calibrated skin are skin
             is_skin = skin_dists < 12.0
             skin_frac = float(np.mean(is_skin))
 
-    # 2. Color stats
+    # Compare the average colour of the center strip against the flanks.
+    # A tie should look noticeably different from the surrounding shirt.
     c_m = np.mean(c_strip, axis=(0, 1))
     l_m = np.mean(l_strip, axis=(0, 1))
     r_m = np.mean(r_strip, axis=(0, 1))
@@ -949,26 +955,28 @@ def _analyze_tie_cv(bgr, faces):
     flank_diff = float(np.linalg.norm(l_m - r_m))
     contrast_ratio = blade_contrast / max(10.0, flank_diff * 0.5 + 8.0)
 
-    # 3. Vertical edges flanking the central blade
+    # Look for vertical edges running along the sides of the tie blade.
+    # A real tie creates clear left and right borders against the shirt.
     gray = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
     sob_x = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
     v_left = sob_x[:, int(cw * 0.28):int(cw * 0.42)]
     v_right = sob_x[:, int(cw * 0.58):int(cw * 0.72)]
     vert_edge_score = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 15.0
 
-    # 4. Tie texture variance (patterns, stripes, weaving)
+    # Check for texture in the center strip (patterns, stripes, weave).
+    # A patterned tie will have higher pixel variance than plain fabric.
     c_gray = gray[:, int(cw * 0.36):int(cw * 0.64)]
     c_var = float(np.std(c_gray))
 
-    # 5. Diverging-edge detection: a V-neckline has edges that diverge downward
-    #    (wider at the bottom), while tie blade edges are roughly parallel.
+    # Check whether edges fan out toward the bottom of the crop. A V-neckline
+    # gets wider as it goes down; a tie stays roughly the same width.
     ch = chest_crop.shape[0]
     diverging_edges = False
     if ch > 20 and cw > 20:
         upper_third = sob_x[:ch // 3, :]
         lower_third = sob_x[2 * ch // 3:, :]
 
-        # Measure horizontal spread of edge energy in upper vs lower thirds
+        # Measure how spread out the edge energy is, top vs. bottom
         def _edge_spread(region):
             col_energy = np.mean(region, axis=0)
             if col_energy.sum() < 1e-6:
@@ -979,21 +987,17 @@ def _analyze_tie_cv(bgr, faces):
 
         upper_spread = _edge_spread(upper_third)
         lower_spread = _edge_spread(lower_third)
-        # If lower edges are significantly wider-spread than upper, it's a V-neckline
+        # If the bottom edges are much wider than the top ones → V-neckline
         if lower_spread > upper_spread * 1.4 and lower_spread > 8.0:
             diverging_edges = True
 
-    # 6. Bilateral contrast symmetry: a real tie creates roughly equal
-    #    contrast on both sides of the center strip.  A zipper, collar fold
-    #    or button line often produces asymmetric contrast.  High asymmetry
-    #    reduces confidence.
+    # A tie should create roughly equal contrast on both sides of the center.
+    # Things like zippers, collar folds, and button lines tend to be lopsided.
     bilateral_symmetry = 1.0 - abs(contrast_left - contrast_right) / max(1.0, max(contrast_left, contrast_right))
 
-    # 7. Color-uniformity rejection: if the central strip has very low color
-    #    variance (same fabric colour as the flanks, e.g. a zipper on a
-    #    monochrome jacket) the contrast comes only from texture/edges, not
-    #    a distinct tie blade colour.  Convert to LAB and check chroma in the
-    #    center vs flanks.
+    # If the center strip is basically the same colour as the flanks (e.g. a
+    # zipper on a solid-colour jacket), there's no distinct tie — whatever
+    # contrast we picked up is just texture, not a different-coloured tie.
     c_lab = cv2.cvtColor(c_strip, cv2.COLOR_BGR2LAB).astype(np.float32)
     c_chroma = float(np.mean(np.sqrt(c_lab[:, :, 1] ** 2 + c_lab[:, :, 2] ** 2)))
     l_lab = cv2.cvtColor(l_strip, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -1002,7 +1006,7 @@ def _analyze_tie_cv(bgr, faces):
                      float(np.mean(np.sqrt(r_lab[:, :, 1] ** 2 + r_lab[:, :, 2] ** 2)))) / 2.0
     chroma_diff = abs(c_chroma - flanks_chroma)
 
-    # Build result dict
+    # Pack up all the measurements so we can include them in the response.
     result_meta = {
         "skin_frac": round(skin_frac, 3),
         "blade_contrast": round(blade_contrast, 2),
@@ -1012,51 +1016,45 @@ def _analyze_tie_cv(bgr, faces):
         "chroma_diff": round(chroma_diff, 2),
     }
 
-    # Reject open collars / bare skin
+    # Too much visible skin in the center → no tie
     if skin_frac > 0.18:
         return {**result_meta, "has_tie": False, "reason": "bare_skin"}
 
-    # Reject plain solid shirt without tie (no central contrast, edges, or texture)
+    # Plain shirt with nothing going on in the center → no tie
     max_flank_contrast = max(contrast_left, contrast_right)
     if blade_contrast < 25.0 and max_flank_contrast < 28.0 and vert_edge_score < 0.40 and c_var < 18.0:
         return {**result_meta, "has_tie": False, "reason": "solid_shirt_no_tie"}
 
-    # Reject diverging-edge patterns (V-necklines, open collars with contrast)
+    # Edges fan outward (V-neckline or open collar) → not a tie
     if diverging_edges and blade_contrast < 50.0:
         return {**result_meta, "has_tie": False, "reason": "v_neckline"}
 
-    # Reject monochrome garment features (zippers, seams on same-colour
-    # fabric): if the center and flanks share similar chroma and the
-    # luminance-only blade contrast is moderate, it is not a tie.
+    # Center looks the same colour as the flanks (zipper, seam, etc.) → not a tie
     if chroma_diff < 4.0 and blade_contrast < 45.0 and c_var < 22.0:
         return {**result_meta, "has_tie": False, "reason": "monochrome_garment_feature"}
 
-    # Reject asymmetric contrast (button line, collar fold, single-side seam):
-    # a real tie produces roughly symmetric contrast on both flanks.
+    # Contrast is lopsided (button line, collar fold, etc.) → not a tie
     if bilateral_symmetry < 0.45 and blade_contrast < 50.0:
         return {**result_meta, "has_tie": False, "reason": "asymmetric_contrast"}
 
-    # 8. Vertical luminance gradient in center column: a tie blade has
-    #    relatively uniform colour along its length, while a V-neckline
-    #    showing an undershirt creates a sharp dark→light (or vice versa)
-    #    transition.  Measure L* range between top and bottom thirds.
-    c_lab_l = c_lab[:, :, 0]  # L* channel of center strip (already computed)
+    # A tie blade has fairly even brightness from top to bottom. If there's
+    # a big light-to-dark jump, it's more likely a V-neckline showing an
+    # undershirt underneath.
+    c_lab_l = c_lab[:, :, 0]  # lightness channel (already computed above)
     c_rows = c_lab_l.shape[0]
     vert_gradient = 0.0
     if c_rows >= 6:
         top_L = float(np.mean(c_lab_l[:c_rows // 3, :]))
         bot_L = float(np.mean(c_lab_l[2 * c_rows // 3:, :]))
         vert_gradient = abs(top_L - bot_L)
-    # A 40+ L* swing in the center column is an open collar / undershirt,
-    # not a uniform tie blade.  Combined with high c_var this is definitive.
+    # Big brightness swing + high texture variance → open collar, not a tie
     if vert_gradient > 35.0 and c_var > 35.0 and blade_contrast < 55.0:
         return {**result_meta, "has_tie": False, "reason": "v_neckline_luminance_gradient"}
 
-    # Tie presence rule — requires strong, multi-signal positive evidence.
-    # Thresholds raised from previous values (22→30, 0.30→0.45) to eliminate
-    # false positives on jacket zippers, collared shirts, and button lines.
-    # The c_var rule additionally requires a small vertical gradient to
-    # exclude V-neckline luminance transitions masquerading as tie texture.
+    # Final decision: we only call it a tie if multiple signals agree.
+    # We need good contrast, clear edges, distinct colour, and symmetry.
+    # Thresholds are set conservatively to avoid false positives from
+    # zippers, button lines, and collared shirts.
     is_tie = (
         skin_frac <= 0.15
         and not diverging_edges
@@ -1591,6 +1589,15 @@ CHECK_LABELS = {
     "eyes_open": "Eyes Open",
 }
 
+# Criteria whose individual failure always blocks an overall pass, regardless
+# of the pass-count gate (enforced explicitly inside run_checks).
+_MANDATORY_CRITERIA = frozenset({"white_background", "no_tie", "require_tie"})
+
+
+def _is_mandatory(key):
+    """True when a failed criterion must always block the overall verdict."""
+    return key in _MANDATORY_CRITERIA
+
 
 def run_checks(image_bytes, enabled_criteria, params=None):
     """
@@ -1604,6 +1611,15 @@ def run_checks(image_bytes, enabled_criteria, params=None):
     compliance check (``white_background``) independently passed.  This
     prevents a moderately blurred but genuinely white-background photo from
     being rejected due to the pass-count gate.
+
+    Masked-failure policy
+    ---------------------
+    By default the overall verdict uses a pass-count gate, so individually
+    failed non-mandatory checks can be hidden by enough passing checks.  The
+    response therefore always reports those hidden checks under
+    ``masked_failures``.  Setting ``params["strict_all_criteria"]`` enables
+    strict mode, in which any failed enabled criterion (except a
+    soft-promoted blur) blocks the overall pass.
     """
     params = params or {}
     started_at = time.perf_counter()
@@ -1666,6 +1682,21 @@ def run_checks(image_bytes, enabled_criteria, params=None):
 
     total_criteria = len(ordered_keys)
     min_required_param = int(params.get("min_pass_criteria", 4))
+    strict_mode = bool(int(params.get("strict_all_criteria", 0)))
+
+    # Failures hidden by the pass-count gate (F1): enabled checks that did not
+    # pass but can be masked by enough other passing checks.  A soft-promoted
+    # blur check was already conditionally accepted, so it is not masked.
+    masked_failures = [
+        key for key, res in results.items()
+        if enabled_criteria.get(key) and not res.get("passed") and not res.get("soft_promoted")
+    ]
+    overall_passed = overall_passed and not masked_failures # strict mode
+    response["masked_failures"] = masked_failures if not strict_mode else [
+        key for key in masked_failures
+        if not _is_mandatory(k)  # preserve legacy when strict_mode=False
+    ]
+
     if total_criteria == 0:
         overall_passed = True
         required_to_pass = 0
@@ -1685,12 +1716,22 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         if enabled_criteria.get("require_tie") and not require_tie_result.get("passed", False):
             overall_passed = False
 
+        if strict_mode:
+            # Strict mode: the pass-count gate alone can never approve a photo
+            # while an individually enabled criterion has failed.
+            overall_passed = overall_passed and not masked_failures
+
     completed_at = time.perf_counter()
     response = {
         "overall_passed": overall_passed,
         "passed_count": passed_count,
         "total_criteria": total_criteria,
         "required_to_pass": required_to_pass,
+        "masked_failures": (
+            []
+            if strict_mode
+            else [key for key in masked_failures if not _is_mandatory(key)]
+        ),
         "results": results,
         "image_info": {
             "width": int(bgr.shape[1]),
