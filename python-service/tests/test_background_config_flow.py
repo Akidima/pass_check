@@ -25,6 +25,8 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from service_client import authenticated_client  # noqa: E402
 from verify import (  # noqa: E402
     BACKGROUND_STRICTNESS_LEVELS,
     _resolve_background_params,
@@ -97,8 +99,7 @@ class AdminSettingsToEndToEndResultTests(unittest.TestCase):
 
     def setUp(self):
         from app import app as flask_app
-        flask_app.config["TESTING"] = True
-        self.client = flask_app.test_client()
+        self.client = authenticated_client(flask_app)
 
     def test_strictness_toggle_changes_outcome_through_http_boundary(self):
         """Same warm-lit wall: fails on Strict, passes on Standard."""

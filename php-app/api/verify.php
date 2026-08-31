@@ -70,6 +70,36 @@ foreach ($blurPolicyDefaults as $key => $default) {
 
 $serviceUrl = rtrim(get_setting('python_service_url', 'http://127.0.0.1:5001'), '/') . '/verify';
 
+// Shared secret required by the Python service (Authorization: Bearer).
+// Read from the environment only — never hardcoded and never sent to the browser.
+$serviceToken = getenv('PORTAL_SHARED_SECRET');
+if ($serviceToken === false || $serviceToken === '') {
+    json_error('Verification service is not configured (missing PORTAL_SHARED_SECRET).', 503);
+}
+// Timeout budget. Measured warm single-request verification is well over 10
+// seconds because tie detection runs a Faster R-CNN on CPU, and requests queue
+// behind the sync Gunicorn workers under concurrent uploads. The previous 30s
+// verify timeout was below the observed queued latency, so legitimate requests
+// were reported to applicants as "service unreachable" while Python kept
+// working on them.
+//
+// Invariant: VERIFY_TIMEOUT + EDIT_TIMEOUT must stay below the Gunicorn
+// `timeout` setting, so Gunicorn never kills a worker that PHP is still
+// waiting on.
+const VERIFY_TIMEOUT_SECONDS = 60;
+const EDIT_TIMEOUT_SECONDS = 30;
+
+/**
+ * Absolute instant (unix milliseconds) at which this caller stops waiting.
+ * The Python service drops queued work whose deadline has already passed
+ * instead of spending CPU on a response nobody will read.
+ */
+function deadline_header(int $timeoutSeconds): string {
+    return 'X-Request-Deadline: ' . (string)(int)round((microtime(true) + $timeoutSeconds) * 1000);
+}
+
+$serviceHeaders = ['Authorization: Bearer ' . $serviceToken];
+
 $cfile = new CURLFile($_FILES['photo']['tmp_name'], $mime, $_FILES['photo']['name']);
 $postFields = [
     'photo' => $cfile,
@@ -82,7 +112,9 @@ curl_setopt_array($ch, [
     CURLOPT_POST => true,
     CURLOPT_POSTFIELDS => $postFields,
     CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 30,
+    CURLOPT_HTTPHEADER => array_merge($serviceHeaders, [deadline_header(VERIFY_TIMEOUT_SECONDS)]),
+    CURLOPT_CONNECTTIMEOUT => 5,
+    CURLOPT_TIMEOUT => VERIFY_TIMEOUT_SECONDS,
 ]);
 
 $response = curl_exec($ch);
@@ -94,7 +126,23 @@ if (PHP_VERSION_ID < 80000) {
 }
 
 if ($curlErrno) {
-    json_error('Verification service is unreachable. Please ensure the Python service is running. (' . $curlError . ')', 503);
+    // Log the transport detail server-side with a correlation id; never echo
+    // cURL text (which can contain internal hostnames, ports and paths) to the
+    // applicant's browser.
+    $correlationId = bin2hex(random_bytes(8));
+    error_log(sprintf(
+        '[verify %s] cURL error %d calling verification service: %s',
+        $correlationId, $curlErrno, $curlError
+    ));
+    // 28 == CURLE_OPERATION_TIMEDOUT. Spelled numerically because PHP exposes
+    // the constant under two different names across versions.
+    $isTimeout = ($curlErrno === 28);
+    json_error(
+        $isTimeout
+            ? 'The verification service is busy and did not respond in time. Please try again in a moment. (Ref: ' . $correlationId . ')'
+            : 'The verification service is temporarily unavailable. Please try again shortly. (Ref: ' . $correlationId . ')',
+        503
+    );
 }
 
 $result = json_decode($response, true);
@@ -113,11 +161,11 @@ $storedName = '';
 if ($isPassed) {
     $uploadsDir = __DIR__ . '/../uploads';
     if (!is_dir($uploadsDir)) {
-        mkdir($uploadsDir, 0777, true);
+        mkdir($uploadsDir, 0750, true);
     }
-    $ext = pathinfo($_FILES['photo']['name'], PATHINFO_EXTENSION) ?: 'jpg';
-    $safeExt = preg_replace('/[^a-zA-Z0-9]/', '', $ext);
-    $storedName = uniqid('photo_', true) . '.' . $safeExt;
+    // The output from /edit-photo is always JPEG. Never derive a stored
+    // extension from the applicant-controlled original filename.
+    $storedName = bin2hex(random_bytes(16)) . '.jpg';
     $targetPath = $uploadsDir . '/' . $storedName;
 
     // Automatically format background to studio-grade pure white (#ffffff) matching chat format
@@ -134,7 +182,9 @@ if ($isPassed) {
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => $postFieldsBg,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 20,
+        CURLOPT_HTTPHEADER => array_merge($serviceHeaders, [deadline_header(EDIT_TIMEOUT_SECONDS)]),
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => EDIT_TIMEOUT_SECONDS,
     ]);
     $formattedBytes = curl_exec($chBg);
     $httpCodeBg = curl_getinfo($chBg, CURLINFO_HTTP_CODE);
@@ -144,8 +194,30 @@ if ($isPassed) {
 
     if ($httpCodeBg === 200 && !empty($formattedBytes)) {
         file_put_contents($targetPath, $formattedBytes);
+        $result['processing'] = ['status' => 'completed', 'format' => 'jpeg'];
     } else {
+        // Editing failed, so retain the verified original with an extension
+        // derived from the server-detected MIME type, not the user filename.
+        $fallbackExt = [
+            'image/jpeg' => 'jpg',
+            'image/png' => 'png',
+            'image/webp' => 'webp',
+        ][$mime] ?? 'jpg';
+        $storedName = bin2hex(random_bytes(16)) . '.' . $fallbackExt;
+        $targetPath = $uploadsDir . '/' . $storedName;
         move_uploaded_file($_FILES['photo']['tmp_name'], $targetPath);
+        // The original photo was accepted, but the standardised white-background
+        // JPEG was NOT produced. Record that distinctly so nothing downstream
+        // assumes the stored file is the generated output.
+        error_log(sprintf(
+            '[verify] /edit-photo failed with HTTP %d; stored unstandardised original %s',
+            $httpCodeBg, $storedName
+        ));
+        $result['processing'] = [
+            'status' => 'failed',
+            'format' => $fallbackExt,
+            'detail' => 'Original accepted, but white-background generation did not run.',
+        ];
     }
 } else {
     // Delete temporary uploaded file so failed photo is not stored/available

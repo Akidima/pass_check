@@ -88,6 +88,36 @@ class TieFalsePositivePreventionTests(unittest.TestCase):
         result = _analyze_tie_cv(bgr, [face])
         self.assertFalse(result["has_tie"], f"False positive tie detected: {result}")
 
+    def test_patterned_red_tie_on_dark_shirt_is_detected(self):
+        """A multi-colored blade must count as a tie even if left/right contrast is uneven."""
+        bgr = np.full((700, 500, 3), 240, dtype=np.uint8)
+        cv2.ellipse(bgr, (250, 170), (80, 95), 0, 0, 360, (90, 120, 160), -1)
+        # Shirt must cover the collar-overlap crop, or the white wall looks
+        # like a V-neck luminance jump.
+        bgr[220:700, 90:410] = (45, 20, 85)
+        bgr[250:310, 170:330] = (10, 10, 10)
+        for y in range(270, 640):
+            for x in range(228, 278):
+                bgr[y, x] = (20, 25, 200) if (x + 2 * y) % 8 < 4 else (15, 15, 20)
+
+        face = {"x": 170, "y": 75, "w": 160, "h": 200, "score": 1.0, "keypoints": None}
+        result = _analyze_tie_cv(bgr, [face])
+        self.assertTrue(result["has_tie"], f"Patterned tie missed: {result}")
+
+    def test_upper_knot_only_crop_is_detected(self):
+        """A short collar crop that shows only the knot is still a tie."""
+        bgr = np.full((360, 400, 3), 240, dtype=np.uint8)
+        cv2.ellipse(bgr, (200, 150), (70, 85), 0, 0, 360, (90, 120, 160), -1)
+        bgr[220:360, 70:330] = (45, 20, 85)
+        bgr[230:300, 140:260] = (10, 10, 10)
+        # Compact knot in the collar seat; no blade below the frame.
+        for y in range(245, 320):
+            half = max(6, 22 - (y - 245) // 3)
+            bgr[y, 200 - half:200 + half] = (25, 30, 190)
+        face = {"x": 130, "y": 65, "w": 140, "h": 175, "score": 1.0, "keypoints": None}
+        result = _analyze_tie_cv(bgr, [face])
+        self.assertTrue(result["has_tie"], f"Knot-only crop missed: {result}")
+
 
 class BenchmarkSampleImagesTests(unittest.TestCase):
     """Regression tests against sample real-world benchmark images."""

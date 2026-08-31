@@ -1,10 +1,46 @@
-flask==3.0.3
-flask-cors==4.0.1
+# Runtime dependencies for the passport verification service.
+#
+# Versions are pinned to the set that was installed and tested together.
+# Unpinned dependencies (previously torch/torchvision) can resolve to an
+# incompatible pair on a fresh server and break the tie detector at runtime.
+# https://packaging.python.org/en/latest/specifications/section-reproducible-environments/
+#
+# Tested on Python 3.9.6.
+
+# --- Web layer ---
+# flask 3.1.3 / flask-cors 6.0.0 pick up published security fixes over the
+# previous 3.0.3 / 4.0.1 pins (flask-cors 4.0.1 has known CORS-bypass advisories).
+flask==3.1.3
+flask-cors==6.0.0
+werkzeug==3.1.8
+gunicorn==23.0.0
+
+# --- Imaging / classical CV ---
 opencv-python-headless==4.10.0.84
-numpy>=1.26,<3
-Pillow>=10.4
-rembg>=2.0.60
-onnxruntime>=1.19.0
+numpy==2.0.2
+pillow==11.3.0
+
+# --- Neural perception ---
 mediapipe==0.10.14
-torch
-torchvision
+rembg==2.0.61
+onnxruntime==1.19.2
+torch==2.8.0
+torchvision==0.23.0
+
+# ---------------------------------------------------------------------------
+# KNOWN UNPATCHED VULNERABILITIES — Python 3.9 runtime limitation
+# ---------------------------------------------------------------------------
+# `pip-audit -r requirements.txt` reports advisories for pillow, torch and
+# rembg. Their fixed releases cannot be installed on Python 3.9:
+#
+#   pillow 12.3.0  requires Python >= 3.10   (13 advisories open on 11.3.0)
+#   torch  2.9.0+  requires Python >= 3.10
+#   rembg  2.0.75  requires Python >= 3.11
+#
+# pillow is the highest risk of the three because it parses untrusted student
+# uploads directly. Upgrading the runtime to Python 3.11 or 3.12 and then
+# re-pinning pillow/torch/rembg is the recommended follow-up. Until then the
+# service relies on the format allowlist and pixel budget in verify.py to
+# reduce the attack surface.
+#
+# Re-run after any change:  pip-audit -r requirements.txt

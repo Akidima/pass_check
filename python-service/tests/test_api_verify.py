@@ -13,7 +13,9 @@ from unittest.mock import patch, MagicMock
 from PIL import Image as PILImage
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from service_client import authenticated_client
 from tie_detector import TieDetection
 
 
@@ -31,8 +33,7 @@ class TestVerifyEndpoint(unittest.TestCase):
 
     def setUp(self):
         from app import app
-        app.config["TESTING"] = True
-        self.client = app.test_client()
+        self.client = authenticated_client(app)
 
     def _post_verify(self, photo_buf, criteria, params=None):
         data = {
@@ -54,6 +55,7 @@ class TestVerifyEndpoint(unittest.TestCase):
     def test_no_tie_present_in_results(self, mock_get_detector, mock_detect_faces):
         """When no_tie is enabled, the result should include a no_tie key."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 
@@ -70,6 +72,7 @@ class TestVerifyEndpoint(unittest.TestCase):
     def test_no_tie_label_present(self, mock_get_detector, mock_detect_faces):
         """The no_tie result should have the correct label."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 
@@ -84,6 +87,7 @@ class TestVerifyEndpoint(unittest.TestCase):
     def test_timing_metadata_present(self, mock_get_detector, mock_detect_faces):
         """Response should include timing metadata."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 
@@ -118,6 +122,7 @@ class TestVerifyEndpoint(unittest.TestCase):
     def test_no_tie_absent_overall_passes(self, mock_get_detector, mock_detect_faces):
         """When no tie is detected, overall_passed should be True."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 
@@ -164,6 +169,7 @@ class TestVerifyEndpoint(unittest.TestCase):
     def test_meta_includes_model_version(self, mock_get_detector):
         """Result meta should always include model_version."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 
@@ -220,8 +226,7 @@ class TestEditPhotoUnchanged(unittest.TestCase):
 
     def setUp(self):
         from app import app
-        app.config["TESTING"] = True
-        self.client = app.test_client()
+        self.client = authenticated_client(app)
 
     def test_edit_photo_endpoint_exists(self):
         """The /edit-photo endpoint should still be accessible."""

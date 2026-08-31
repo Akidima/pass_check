@@ -9,13 +9,14 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import app as service_app  # noqa: E402
+from service_client import authenticated_client  # noqa: E402
 
 
 class WarmupEndpointTests(unittest.TestCase):
     def setUp(self):
-        service_app.app.config["TESTING"] = True
-        self.client = service_app.app.test_client()
+        self.client = authenticated_client(service_app.app)
 
     def test_warmup_returns_ok_and_reports_loaded_models(self):
         with patch("app.get_tie_detector") as fake_det, \
@@ -36,6 +37,7 @@ class WarmupEndpointTests(unittest.TestCase):
         data = resp.get_json()
         self.assertFalse(data["tie_detector_loaded"])
         self.assertIn("tie_detector_error", data)
+        self.assertEqual(data["tie_detector_error"], "RuntimeError")
         self.assertFalse(data["rembg_session_loaded"])
 
     def test_warmup_accepts_get_too(self):

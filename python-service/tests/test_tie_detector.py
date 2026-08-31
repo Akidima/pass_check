@@ -14,7 +14,14 @@ from dataclasses import FrozenInstanceError
 from PIL import Image
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from tie_detector import TieDetection, TieDetector, get_tie_detector, validate_tie_detection
+from tie_detector import (
+    TieDetection,
+    TieDetector,
+    get_tie_detector,
+    input_size_budget,
+    _fit_longest_side,
+    validate_tie_detection,
+)
 
 
 GEOMETRY = {
@@ -152,6 +159,54 @@ class TestGetTieDetector(unittest.TestCase):
             get_tie_detector()
         mock_coco.assert_called_once()
         get_tie_detector.cache_clear()
+
+
+class InputSizeBudgetTests(unittest.TestCase):
+    """The input budget decides both tie latency and service capacity.
+
+    It was chosen by measuring decision equivalence on real submissions, so an
+    accidental change to the default is a decision change, not a tuning tweak.
+    """
+
+    def test_default_budget_is_the_measured_one(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(input_size_budget(), (32, 1024))
+
+    def test_explicit_override_is_honoured(self):
+        with patch.dict("os.environ", {
+            "TIE_INPUT_MIN_SIZE": "800",
+            "TIE_INPUT_MAX_SIZE": "1333",
+        }):
+            self.assertEqual(input_size_budget(), (800, 1333))
+
+    def test_non_numeric_override_falls_back_to_default(self):
+        with patch.dict("os.environ", {"TIE_INPUT_MAX_SIZE": "wide"}):
+            self.assertEqual(input_size_budget(), (32, 1024))
+
+    def test_out_of_range_override_falls_back_to_default(self):
+        with patch.dict("os.environ", {"TIE_INPUT_MIN_SIZE": "0"}):
+            self.assertEqual(input_size_budget(), (32, 1024))
+
+    def test_inverted_budget_falls_back_rather_than_producing_a_bad_transform(self):
+        with patch.dict("os.environ", {
+            "TIE_INPUT_MIN_SIZE": "1000",
+            "TIE_INPUT_MAX_SIZE": "500",
+        }):
+            self.assertEqual(input_size_budget(), (32, 1024))
+
+
+class FitLongestSideTests(unittest.TestCase):
+    def test_small_roi_is_unchanged(self):
+        image = Image.new("RGB", (400, 200), (0, 0, 0))
+        out, scale = _fit_longest_side(image, 640)
+        self.assertEqual(out.size, (400, 200))
+        self.assertEqual(scale, 1.0)
+
+    def test_wide_roi_is_capped_and_boxes_map_back(self):
+        image = Image.new("RGB", (1200, 400), (0, 0, 0))
+        out, scale = _fit_longest_side(image, 640)
+        self.assertEqual(out.size[0], 640)
+        self.assertAlmostEqual(out.size[0] * scale, 1200, places=0)
 
 
 if __name__ == "__main__":

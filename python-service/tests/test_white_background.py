@@ -145,10 +145,43 @@ class WhiteBackgroundTests(unittest.TestCase):
         import verify
         if not getattr(verify, "MEDIAPIPE_AVAILABLE", False) or getattr(verify, "mp_face_detection", None) is None:
             self.skipTest("MediaPipe not available in environment")
+        # The induced failure opens a real cooldown, so clear it afterwards or
+        # every later test in this process inherits a degraded worker. Also
+        # drop any cached MediaPipe graph so this patch hits the constructor.
+        verify.reset_perception_health()
+        self.addCleanup(verify.reset_perception_health)
         with patch.object(
             verify.mp_face_detection, "FaceDetection", side_effect=RuntimeError("GPU unavailable")
         ):
             self.assertEqual(_detect_faces(self.image()), [])
+
+    def test_mediapipe_failure_does_not_permanently_disable_landmarks(self):
+        """A transient MediaPipe error must not reject every later applicant.
+
+        The Haar fallback cannot produce landmarks, so if the failure latched
+        on, head_pose and eyes_open would fail for the rest of the worker's
+        life and every subsequent photo would be rejected while /health still
+        reported "ok".
+        """
+        import verify
+        if not getattr(verify, "MEDIAPIPE_AVAILABLE", False) or getattr(verify, "mp_face_detection", None) is None:
+            self.skipTest("MediaPipe not available in environment")
+        verify.reset_perception_health()
+        self.addCleanup(verify.reset_perception_health)
+
+        with patch.object(
+            verify.mp_face_detection, "FaceDetection", side_effect=RuntimeError("GPU unavailable")
+        ):
+            _detect_faces(self.image())
+
+        self.assertTrue(verify.MEDIAPIPE_AVAILABLE, "import-time flag must not be mutated")
+        degraded = verify.perception_health()
+        self.assertFalse(degraded["landmarks_available"])
+        self.assertGreater(degraded["mediapipe_cooldown_seconds_remaining"], 0)
+
+        # Recovery must not require a worker restart.
+        verify.reset_perception_health()
+        self.assertTrue(verify.perception_health()["landmarks_available"])
 
 
 # =====================================================================
@@ -159,10 +192,21 @@ class RealWorldMobileSubmissionTests(unittest.TestCase):
     """Test validation on actual real-world student submissions."""
 
     def test_user_uploaded_image_passes(self):
-        """The user's real-world student mobile photo must pass validation."""
-        path = "/Users/georgeakidima/.gemini/antigravity-ide/brain/23cbe225-6d40-46d1-8c8d-ee2bd4df5328/.user_uploaded/media_1786812369461.jpg"
-        if not os.path.exists(path):
-            self.skipTest("User uploaded media file not found on disk.")
+        """A real-world student mobile photo must pass validation.
+
+        Point REAL_PHOTO_FIXTURE at a known-good photograph to run this on a
+        deployment host; it skips rather than failing when unset.
+        """
+        import verify
+
+        path = os.environ.get("REAL_PHOTO_FIXTURE", "").strip()
+        if not path or not os.path.exists(path):
+            self.skipTest("No real-photo fixture available (set REAL_PHOTO_FIXTURE).")
+
+        verify.reset_perception_health()
+        self.addCleanup(verify.reset_perception_health)
+        if not verify.perception_health()["landmarks_available"]:
+            self.skipTest("MediaPipe landmarks are unavailable in this environment.")
 
         with open(path, "rb") as f:
             img_bytes = f.read()
@@ -307,8 +351,8 @@ class SoftFailurePromotionTests(unittest.TestCase):
         assert ok
         return encoded.tobytes()
 
-    def test_soft_blur_white_bg_passes_overall(self):
-        """A white-background image with soft blur should pass overall."""
+    def test_soft_blur_white_bg_requires_review(self):
+        """A failed enabled quality check cannot be promoted to acceptance."""
         img = self._make_soft_blur_white_bg_image()
         sharpness = _measure_sharpness(img, [])
         if not (15 <= sharpness < 80):
@@ -324,7 +368,7 @@ class SoftFailurePromotionTests(unittest.TestCase):
         bg_passed = result["results"].get("white_background", {}).get("passed", False)
         blur_severity = result["results"].get("no_blur", {}).get("meta", {}).get("severity")
         if bg_passed and blur_severity == "soft":
-            self.assertTrue(result["overall_passed"], result)
+            self.assertFalse(result["overall_passed"], result)
             self.assertIn("quality_notes", result)
 
     def test_soft_blur_nonwhite_bg_still_fails(self):
@@ -912,4 +956,3 @@ class MixedBackgroundSamplingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

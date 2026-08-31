@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "enforcement": "type_only",
+  "allowed_types": ["necktie"],
+  "notes": [
+    "The repository has no official-tie reference image, colour, or pattern.",
+    "type_only accepts a traditional necktie and rejects bow ties, scarves, and other neckwear.",
+    "Set enforcement to appearance and fill appearance ranges only after the university publishes the official design.",
+    "Do not invent hue or LAB ranges. Black-on-black samples are inconclusive for colour and must not be rejected on colour alone."
+  ],
+  "appearance": {
+    "hue_ranges_hsv": [],
+    "lab_l_range": null,
+    "min_chroma": null,
+    "max_chroma": null
+  }
+}

@@ -1,0 +1,11 @@
+# Test and audit tooling. Not installed on production hosts, but required to
+# run the acceptance suite on a deployment host before releasing traffic:
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pytest tests/ -q
+#   pip-audit -r requirements.txt
+#
+-r requirements.txt
+
+pytest==8.4.2
+pip-audit==2.7.3

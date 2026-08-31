@@ -54,8 +54,9 @@ class TestCheckNoTie(unittest.TestCase):
 
     @patch("verify.get_tie_detector")
     def test_tie_absent_accepts(self, mock_get_detector):
-        """No detection should accept (passed=True)."""
+        """A detector that supports absence can accept no tie."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 
@@ -74,6 +75,7 @@ class TestCheckNoTie(unittest.TestCase):
     def test_low_confidence_accepts(self, mock_get_detector):
         """Detection below accept_threshold should be treated as absent."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = TieDetection(
             confidence=0.10, bbox=(200, 350, 280, 550)
         )
@@ -85,6 +87,20 @@ class TestCheckNoTie(unittest.TestCase):
 
         self.assertTrue(result["passed"])
         self.assertEqual(result["meta"]["tie_status"], "tie_absent")
+
+    @patch("verify.get_tie_detector")
+    def test_unsupported_absence_decision_requires_review(self, mock_get_detector):
+        """A one-class detector must not treat a miss as proof of no tie."""
+        mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = False
+        mock_detector.detect.return_value = None
+        mock_get_detector.return_value = mock_detector
+
+        result = check_no_tie(_make_image(), _make_faces(), {})
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["meta"]["decision"], "manual_review")
+        self.assertEqual(result["meta"]["reason"], "absence_not_supported")
 
     # --- Uncertain -> passed=False + manual_review ---
 
@@ -200,6 +216,7 @@ class TestNoTieHardComplianceGate(unittest.TestCase):
     def test_no_tie_absent_allows_overall_pass(self, mock_get_detector, mock_detect_faces):
         """When no tie is detected and no_tie is enabled, it should pass."""
         mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
         mock_detector.detect.return_value = None
         mock_get_detector.return_value = mock_detector
 

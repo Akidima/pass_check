@@ -20,11 +20,19 @@ only the checks the admin has toggled on, and returns an aggregate result.
 import io
 import logging
 import os
+import threading
 import time
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
+from official_tie import (
+    classify_neckwear_type,
+    decide_require_tie,
+    load_official_tie_policy,
+    measure_appearance,
+    match_official_appearance,
+)
 from tie_visibility import UpperBodyVisibilityEstimator
 from tie_detector import (
     TieDetection,
@@ -32,6 +40,10 @@ from tie_detector import (
     get_tie_detector,
     validate_tie_detection,
 )
+
+logger = logging.getLogger(__name__)
+# Historical alias used throughout the tie-detection helpers below.
+_logger = logger
 
 try:
     import mediapipe as mp
@@ -44,20 +56,223 @@ except (ImportError, AttributeError, Exception):
 # Fallback Haar cascade for face detection when mediapipe isn't installed
 _HAAR_FACE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
+# ---------------------------------------------------------------------------
+# MediaPipe runtime health
+# ---------------------------------------------------------------------------
+# MEDIAPIPE_AVAILABLE records whether the library could be imported. It must
+# never be mutated at runtime: a single transient graph/GPU-context error would
+# otherwise disable landmarks for the entire remaining life of the worker, and
+# because every enabled criterion is mandatory, head_pose and eyes_open would
+# then reject every following upload while /health still reported "ok".
+#
+# Runtime errors instead open a short, self-healing cooldown. During the
+# cooldown we skip MediaPipe (so a genuinely broken install does not pay the
+# initialization cost on every request); afterwards we retry automatically.
+_MEDIAPIPE_COOLDOWN_SECONDS = 30.0
+_MEDIAPIPE_LOCK = threading.Lock()
+_MEDIAPIPE_COOLDOWN_UNTIL = 0.0
+_MEDIAPIPE_FAILURES = 0
+_MEDIAPIPE_LAST_ERROR = None
+
+# Graph construction is the expensive part of MediaPipe on CPU (GL context +
+# TFLite delegate). Creating FaceDetection and FaceMesh on every photograph
+# was adding several seconds before any check ran, and head_pose + eyes_open
+# each built a fresh FaceMesh. Sessions are reused for the life of the worker
+# and guarded by the same lock (the graphs are not thread-safe).
+_FACE_DETECTOR = None
+_FACE_MESH = None
+_LANDMARK_CACHE_ID = None
+_LANDMARK_CACHE_VAL = None
+
+
+def _mediapipe_usable():
+    """True when MediaPipe is importable and not inside a failure cooldown."""
+    if not MEDIAPIPE_AVAILABLE:
+        return False
+    with _MEDIAPIPE_LOCK:
+        return time.monotonic() >= _MEDIAPIPE_COOLDOWN_UNTIL
+
+
+def _note_mediapipe_failure(exc):
+    """Open a bounded cooldown after a MediaPipe runtime error."""
+    global _MEDIAPIPE_COOLDOWN_UNTIL, _MEDIAPIPE_FAILURES, _MEDIAPIPE_LAST_ERROR
+    with _MEDIAPIPE_LOCK:
+        _MEDIAPIPE_FAILURES += 1
+        _MEDIAPIPE_LAST_ERROR = f"{type(exc).__name__}: {exc}"[:200]
+        _MEDIAPIPE_COOLDOWN_UNTIL = time.monotonic() + _MEDIAPIPE_COOLDOWN_SECONDS
+
+
+def _note_mediapipe_success():
+    """Clear the cooldown once MediaPipe works again."""
+    global _MEDIAPIPE_COOLDOWN_UNTIL
+    with _MEDIAPIPE_LOCK:
+        if _MEDIAPIPE_COOLDOWN_UNTIL:
+            _MEDIAPIPE_COOLDOWN_UNTIL = 0.0
+
+
+def perception_health():
+    """Report MediaPipe health so readiness probes can see a degraded worker.
+
+    A worker that has fallen back to Haar cascades cannot evaluate head pose or
+    eyes-open, so it rejects otherwise valid photographs. That must be visible
+    to operators rather than silently reducing every applicant's result.
+    """
+    with _MEDIAPIPE_LOCK:
+        cooldown_remaining = max(0.0, _MEDIAPIPE_COOLDOWN_UNTIL - time.monotonic())
+        return {
+            "mediapipe_imported": bool(MEDIAPIPE_AVAILABLE),
+            "landmarks_available": bool(MEDIAPIPE_AVAILABLE) and cooldown_remaining == 0.0,
+            "mediapipe_failures": _MEDIAPIPE_FAILURES,
+            "mediapipe_cooldown_seconds_remaining": round(cooldown_remaining, 1),
+            "mediapipe_last_error": _MEDIAPIPE_LAST_ERROR,
+        }
+
+
+def _close_mediapipe_sessions_locked():
+    """Drop cached MediaPipe graphs. Caller must hold ``_MEDIAPIPE_LOCK``."""
+    global _FACE_DETECTOR, _FACE_MESH, _LANDMARK_CACHE_ID, _LANDMARK_CACHE_VAL
+    for session in (_FACE_DETECTOR, _FACE_MESH):
+        if session is None:
+            continue
+        try:
+            session.close()
+        except Exception:
+            pass
+    _FACE_DETECTOR = None
+    _FACE_MESH = None
+    _LANDMARK_CACHE_ID = None
+    _LANDMARK_CACHE_VAL = None
+
+
+def reset_perception_health():
+    """Clear recorded MediaPipe failures and cached graphs.
+
+    Tests that patch ``FaceDetection`` / ``FaceMesh`` must call this first so
+    the constructor is used again rather than a live cached graph.
+    """
+    global _MEDIAPIPE_COOLDOWN_UNTIL, _MEDIAPIPE_FAILURES, _MEDIAPIPE_LAST_ERROR
+    with _MEDIAPIPE_LOCK:
+        _MEDIAPIPE_COOLDOWN_UNTIL = 0.0
+        _MEDIAPIPE_FAILURES = 0
+        _MEDIAPIPE_LAST_ERROR = None
+        _close_mediapipe_sessions_locked()
+
+
+def _ensure_face_detector_locked():
+    """Return a live FaceDetection graph, creating it once per worker."""
+    global _FACE_DETECTOR
+    if _FACE_DETECTOR is None:
+        _FACE_DETECTOR = mp_face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.6
+        )
+    return _FACE_DETECTOR
+
+
+def _ensure_face_mesh_locked():
+    """Return a live FaceMesh graph, creating it once per worker."""
+    global _FACE_MESH
+    if _FACE_MESH is None:
+        _FACE_MESH = mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=2,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+        )
+    return _FACE_MESH
+
+
+def _int_env(name, default, *, minimum, maximum):
+    """Read a bounded integer environment variable, falling back on bad input."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; using default %s.", name, raw, default
+        )
+        return default
+    if value < minimum or value > maximum:
+        logger.warning(
+            "%s=%s out of range [%s, %s]; using default %s.",
+            name, value, minimum, maximum, default,
+        )
+        return default
+    return value
+
+
+# Upper bound on decoded pixels. A 12 MB upload can still expand into a
+# multi-gigapixel bitmap, so the compressed size limit alone is not enough
+# protection against decompression bombs.
+# https://pillow.readthedocs.io/en/stable/reference/Image.html#PIL.Image.open
+MAX_IMAGE_PIXELS = _int_env(
+    "MAX_IMAGE_PIXELS", 40_000_000, minimum=1_000_000, maximum=500_000_000
+)
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+# Only formats the portal actually accepts are decoded.
+ALLOWED_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+
+
+class ImageValidationError(ValueError):
+    """Raised when an upload cannot be safely decoded as a portrait photo."""
+
+
 # ---------- Helpers ----------
 
-def _load_image(image_bytes):
-    """Load image bytes into an OpenCV BGR array, correcting EXIF orientation."""
-    pil_img = Image.open(io.BytesIO(image_bytes))
+def load_validated_image(image_bytes):
+    """Decode upload bytes into an EXIF-corrected RGB ``PIL.Image``.
+
+    Raises ``ImageValidationError`` with a caller-safe message when the payload
+    is empty, is not an allowed image format, is corrupt, or would decode into
+    an unreasonably large bitmap.
+    """
+    if not image_bytes:
+        raise ImageValidationError("Empty image payload.")
+
     try:
-        from PIL import ImageOps
+        pil_img = Image.open(io.BytesIO(image_bytes))
+    except Image.DecompressionBombError as exc:
+        raise ImageValidationError("Image is too large to process safely.") from exc
+    except Exception as exc:
+        raise ImageValidationError("Unsupported or corrupt image file.") from exc
+
+    image_format = (pil_img.format or "").upper()
+    if image_format not in ALLOWED_IMAGE_FORMATS:
+        raise ImageValidationError(
+            "Unsupported image format. Allowed formats: JPEG, PNG, WEBP."
+        )
+
+    width, height = pil_img.size
+    if width <= 0 or height <= 0:
+        raise ImageValidationError("Image has invalid dimensions.")
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ImageValidationError(
+            f"Image is too large ({width}x{height}). "
+            f"Maximum supported size is {MAX_IMAGE_PIXELS} pixels."
+        )
+
+    try:
         pil_img = ImageOps.exif_transpose(pil_img)
     except Exception:
-        pass
-    pil_img = pil_img.convert("RGB")
+        # Orientation metadata is best-effort; a broken EXIF block must not
+        # prevent an otherwise valid photo from being verified.
+        logger.debug("EXIF transpose failed; using raw orientation.")
+
+    try:
+        return pil_img.convert("RGB")
+    except Exception as exc:
+        raise ImageValidationError("Image could not be decoded.") from exc
+
+
+def _load_image(image_bytes):
+    """Load image bytes into a validated OpenCV BGR array."""
+    pil_img = load_validated_image(image_bytes)
     arr = np.array(pil_img)
-    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    return bgr
+    if arr.size == 0:
+        raise ImageValidationError("Image could not be decoded.")
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
 def _nms_faces(faces, h, w, iou_threshold=0.35, min_area_ratio=0.03):
@@ -117,15 +332,15 @@ def _detect_faces(bgr, meta_out: dict = None) -> list[dict]:
     """Return list of face detections with bounding boxes (relative + absolute).
     Uses mediapipe when available, otherwise falls back to OpenCV's Haar cascade.
     Applies NMS to filter out duplicate overlapping boxes and tiny false positives."""
-    global MEDIAPIPE_AVAILABLE
     h, w = bgr.shape[:2]
 
     faces = []
     mediapipe_failed = False
-    if MEDIAPIPE_AVAILABLE:
+    if _mediapipe_usable():
         try:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.6) as fd:
+            with _MEDIAPIPE_LOCK:
+                fd = _ensure_face_detector_locked()
                 results = fd.process(rgb)
                 if results.detections:
                     for det in results.detections:
@@ -139,15 +354,24 @@ def _detect_faces(bgr, meta_out: dict = None) -> list[dict]:
                             "score": float(det.score[0]) if det.score else 0.0,
                             "keypoints": det.location_data.relative_keypoints
                         })
+            _note_mediapipe_success()
             if meta_out is not None:
                 meta_out["face_backend"] = "MediaPipe"
-        except Exception:
-            logger.warning("MediaPipe failed; using Haar Cascade for this image.")
-            # Fall back to Haar cascades if MediaPipe fails to initialize
+        except Exception as exc:
+            # Fall back to Haar cascades for THIS image only, and open a short
+            # cooldown. Drop the cached graph so the next retry constructs a
+            # fresh one rather than reusing a broken session.
+            logger.warning(
+                "MediaPipe failed (%s); using Haar Cascade for this image and "
+                "retrying MediaPipe in %.0fs.",
+                type(exc).__name__, _MEDIAPIPE_COOLDOWN_SECONDS,
+            )
             mediapipe_failed = True
-            MEDIAPIPE_AVAILABLE = False
+            with _MEDIAPIPE_LOCK:
+                _close_mediapipe_sessions_locked()
+            _note_mediapipe_failure(exc)
 
-    if not MEDIAPIPE_AVAILABLE or mediapipe_failed:
+    if mediapipe_failed or not _mediapipe_usable():
         # Haar cascade fallback
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
@@ -160,21 +384,50 @@ def _detect_faces(bgr, meta_out: dict = None) -> list[dict]:
 
 
 def _face_mesh_landmarks(bgr):
-    """Fine-grained facial landmarks via mediapipe FaceMesh. Returns None if
-    mediapipe is unavailable — callers must handle that gracefully (checks
-    that depend on it will skip rather than fail)."""
-    if not MEDIAPIPE_AVAILABLE:
+    """Fine-grained facial landmarks via mediapipe FaceMesh.
+
+    Returns None when landmarks genuinely cannot be produced. Callers treat
+    that as "evidence unavailable" and route to manual review, so a MediaPipe
+    runtime error must not be allowed to persist beyond its cooldown.
+
+    Head pose and eyes-open both need the same landmarks. The result is cached
+    on the identity of ``bgr`` for the rest of this request so FaceMesh runs
+    once per photograph, not once per check.
+    """
+    global _LANDMARK_CACHE_ID, _LANDMARK_CACHE_VAL
+    if not _mediapipe_usable():
         return None
+    cache_key = id(bgr)
+    with _MEDIAPIPE_LOCK:
+        if cache_key == _LANDMARK_CACHE_ID:
+            return _LANDMARK_CACHE_VAL
     h, w = bgr.shape[:2]
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=2,
-                                refine_landmarks=True, min_detection_confidence=0.5) as fm:
-        results = fm.process(rgb)
-        if not results.multi_face_landmarks:
-            return None
-        lm = results.multi_face_landmarks[0]
-        pts = [(int(p.x * w), int(p.y * h)) for p in lm.landmark]
+    try:
+        with _MEDIAPIPE_LOCK:
+            if cache_key == _LANDMARK_CACHE_ID:
+                return _LANDMARK_CACHE_VAL
+            fm = _ensure_face_mesh_locked()
+            results = fm.process(rgb)
+            if not results.multi_face_landmarks:
+                pts = None
+            else:
+                lm = results.multi_face_landmarks[0]
+                pts = [(int(p.x * w), int(p.y * h)) for p in lm.landmark]
+            _LANDMARK_CACHE_ID = cache_key
+            _LANDMARK_CACHE_VAL = pts
+        _note_mediapipe_success()
         return pts
+    except Exception as exc:
+        logger.warning(
+            "FaceMesh failed (%s); landmark checks will require manual review "
+            "and MediaPipe will be retried in %.0fs.",
+            type(exc).__name__, _MEDIAPIPE_COOLDOWN_SECONDS,
+        )
+        with _MEDIAPIPE_LOCK:
+            _close_mediapipe_sessions_locked()
+        _note_mediapipe_failure(exc)
+        return None
 
 
 def _extract_face_skin_profile(bgr, pts=None, face=None):
@@ -811,8 +1064,6 @@ def check_white_background(bgr, faces, params):
     return {"passed": False, "message": "White background not accepted, please try again.", "meta": meta}
 
 
-_logger = logging.getLogger(__name__)
-
 # Cached estimator instance — created once per worker.
 _upper_body_estimator = UpperBodyVisibilityEstimator()
 
@@ -820,11 +1071,11 @@ _upper_body_estimator = UpperBodyVisibilityEstimator()
 _TEST_TIE_GEOMETRY = {
     "min_width_face_ratio": 0.04,
     "max_width_face_ratio": 0.85,
-    "min_height_face_ratio": 0.12,
+    "min_height_face_ratio": 0.06,
     "max_height_face_ratio": 1.60,
-    "min_top_offset_face_ratio": -0.30,
+    "min_top_offset_face_ratio": -0.45,
     "max_top_offset_face_ratio": 1.35,
-    "max_center_offset_face_ratio": 0.35,
+    "max_center_offset_face_ratio": 0.40,
 }
 
 
@@ -879,15 +1130,108 @@ def _tie_absent_result(model_version, *, reason, confidence=0.0, bbox=None):
     }
 
 
+def _illumination_robust_tie_cues(chest_crop):
+    """Measure dark-on-dark structure without rewriting the stored photograph.
+
+    CLAHE is applied to a copy of the L channel only. The original BGR crop is
+    never mutated, so enhancement cannot invent a garment that is not there —
+    it only makes existing local edges measurable when mean RGB contrast is low.
+    """
+    empty = {
+        "clahe_vert_edge_score": 0.0,
+        "local_l_contrast": 0.0,
+        "ridge_width_frac": 0.0,
+        "horizontal_bimodality": 0.0,
+    }
+    if chest_crop is None or chest_crop.size == 0:
+        return empty
+    ch, cw = chest_crop.shape[:2]
+    if ch < 8 or cw < 16:
+        return empty
+
+    lab = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2LAB)
+    l_chan = lab[:, :, 0]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l_chan)
+    scharr_x = np.abs(cv2.Scharr(l_eq, cv2.CV_64F, 1, 0))
+    v_left = scharr_x[:, int(cw * 0.28):int(cw * 0.42)]
+    v_right = scharr_x[:, int(cw * 0.58):int(cw * 0.72)]
+    clahe_vert = 0.0
+    if v_left.size and v_right.size:
+        clahe_vert = (float(np.mean(v_left)) + float(np.mean(v_right))) / 2.0 / 18.0
+
+    c_l = l_eq[:, int(cw * 0.36):int(cw * 0.64)]
+    local_l = float(np.std(c_l)) if c_l.size else 0.0
+
+    widths = []
+    for row in l_eq:
+        fl = float(np.mean(row[: max(1, int(cw * 0.22))]))
+        fr = float(np.mean(row[int(cw * 0.78):]))
+        flank = (fl + fr) / 2.0
+        diff = np.abs(row.astype(np.float32) - flank)
+        gate = max(5.0, float(np.percentile(diff, 65)) * 0.45)
+        mask = diff > gate
+        if not mask.any():
+            continue
+        padded = np.concatenate(([False], mask, [False]))
+        starts = np.flatnonzero(~padded[:-1] & padded[1:])
+        ends = np.flatnonzero(padded[:-1] & ~padded[1:])
+        if starts.size == 0:
+            continue
+        runs = ends - starts
+        best = int(np.argmax(runs))
+        run_start, run_end = int(starts[best]), int(ends[best])
+        mid = 0.5 * (run_start + run_end)
+        if abs(mid - cw * 0.5) <= cw * 0.22:
+            widths.append(run_end - run_start)
+    ridge = float(np.median(widths) / cw) if widths else 0.0
+
+    upper = l_eq[: max(4, ch // 3), :]
+    col_energy = np.mean(np.abs(cv2.Scharr(upper, cv2.CV_64F, 1, 0)), axis=0)
+    mid = cw // 2
+    left = col_energy[:mid]
+    right = col_energy[mid:]
+    bimodality = 0.0
+    if left.size and right.size:
+        left_peak = float(np.max(left))
+        right_peak = float(np.max(right))
+        centre = float(np.mean(col_energy[int(cw * 0.44):int(cw * 0.56)])) if cw >= 8 else 0.0
+        peak = max(left_peak, right_peak, 1e-6)
+        if left_peak > 0.35 * peak and right_peak > 0.35 * peak:
+            bimodality = max(0.0, min(1.0, (min(left_peak, right_peak) - centre) / peak))
+
+    return {
+        "clahe_vert_edge_score": round(clahe_vert, 3),
+        "local_l_contrast": round(local_l, 2),
+        "ridge_width_frac": round(ridge, 3),
+        "horizontal_bimodality": round(bimodality, 3),
+    }
+
+
+def _infer_neckwear_shape(cv_meta, crop_h, crop_w, face_h):
+    """Cheap structural type hint. Never used as a demographic signal.
+
+    The chest crop is almost always wider than it is tall, so crop aspect
+    must not be used to declare a bow tie or scarf.
+    """
+    ridge = float(cv_meta.get("ridge_width_frac") or 0.0)
+    bimodality = float(cv_meta.get("horizontal_bimodality") or 0.0)
+    short = crop_h <= max(36, int(face_h * 0.55))
+    if short and bimodality >= 0.62:
+        return "bow_tie"
+    if ridge >= 0.07 and ridge <= 0.28:
+        return "necktie"
+    return ""
+
+
 def _analyze_tie_cv(bgr, faces):
     """
-    Analyzes chest/torso region for structural necktie presence when learned model is unavailable.
-    Accurately identifies neckties by verifying:
-    1. Skin-tone exclusion in central column (open collar / bare throat -> NO TIE).
-    2. Central tie blade contrast against bilateral shirt flanks (plain solid shirt -> NO TIE).
-    3. Bilateral shirt symmetry (shirt fabric on left matches right).
-    4. Vertical edge gradients flanking the tie blade.
-    5. Diverging-edge rejection (V-necklines are NOT ties).
+    Analyze the collar/chest region for structural necktie presence.
+
+    Color and contrast are supporting evidence only. A patterned, multi-colored,
+    or shirt-matching blade is still a tie if it occupies the collar-to-placket
+    slot as a vertical member. Hard negatives remain: bare throat, V-neck,
+    shirt placket, and a monochrome zipper.
     """
     _default_result = {"has_tie": False, "skin_frac": 0.0, "blade_contrast": 0.0, "contrast_ratio": 0.0, "vert_edge_score": 0.0}
 
@@ -906,13 +1250,14 @@ def _analyze_tie_cv(bgr, faces):
         chin = pts[152]
         eye_span = max(10, abs(pts[362][0] - pts[133][0]))
         cx, cy = chin[0], chin[1]
-        cy1 = min(h, cy + int(eye_span * 0.20))
+        # Include the collar seat / knot, which sits at or just below the chin.
+        cy1 = max(0, cy - int(eye_span * 0.15))
         cy2 = min(h, cy + int(eye_span * 2.80))
         torso_w = max(int(fw * 1.2), int(eye_span * 3.2))
     else:
         cx = fx + fw // 2
         chin_y = min(h, fy + fh)
-        cy1 = min(h, chin_y + int(fh * 0.10))
+        cy1 = max(0, chin_y - int(fh * 0.25))
         cy2 = min(h, chin_y + int(fh * 0.95))
         torso_w = int(fw * 1.2)
 
@@ -1006,6 +1351,14 @@ def _analyze_tie_cv(bgr, faces):
                      float(np.mean(np.sqrt(r_lab[:, :, 1] ** 2 + r_lab[:, :, 2] ** 2)))) / 2.0
     chroma_diff = abs(c_chroma - flanks_chroma)
 
+    robust = _illumination_robust_tie_cues(chest_crop)
+    necktie_ridge = 0.07 <= float(robust["ridge_width_frac"]) <= 0.28
+    residual_structure = (
+        float(robust["clahe_vert_edge_score"]) >= 0.28
+        or float(robust["local_l_contrast"]) >= 3.5
+        or necktie_ridge
+    )
+
     # Pack up all the measurements so we can include them in the response.
     result_meta = {
         "skin_frac": round(skin_frac, 3),
@@ -1014,7 +1367,26 @@ def _analyze_tie_cv(bgr, faces):
         "vert_edge_score": round(vert_edge_score, 2),
         "bilateral_symmetry": round(bilateral_symmetry, 3),
         "chroma_diff": round(chroma_diff, 2),
+        "center_variance": round(c_var, 2),
+        "clahe_vert_edge_score": robust["clahe_vert_edge_score"],
+        "local_l_contrast": robust["local_l_contrast"],
+        "ridge_width_frac": robust["ridge_width_frac"],
+        "horizontal_bimodality": robust["horizontal_bimodality"],
+        "residual_structure": bool(residual_structure),
+        "knot_only_crop": bool(ch <= max(36, int(fh * 0.55))),
     }
+
+    # A tie blade has fairly even brightness from top to bottom. If there's
+    # a big light-to-dark jump, it's more likely a V-neckline showing an
+    # undershirt underneath.
+    c_lab_l = c_lab[:, :, 0]
+    c_rows = c_lab_l.shape[0]
+    vert_gradient = 0.0
+    if c_rows >= 6:
+        top_L = float(np.mean(c_lab_l[:c_rows // 3, :]))
+        bot_L = float(np.mean(c_lab_l[2 * c_rows // 3:, :]))
+        vert_gradient = abs(top_L - bot_L)
+    result_meta["vert_gradient"] = round(vert_gradient, 2)
 
     # Too much visible skin in the center → no tie
     if skin_frac > 0.18:
@@ -1022,7 +1394,14 @@ def _analyze_tie_cv(bgr, faces):
 
     # Plain shirt with nothing going on in the center → no tie
     max_flank_contrast = max(contrast_left, contrast_right)
-    if blade_contrast < 25.0 and max_flank_contrast < 28.0 and vert_edge_score < 0.40 and c_var < 18.0:
+    if (
+        blade_contrast < 25.0
+        and max_flank_contrast < 28.0
+        and vert_edge_score < 0.40
+        and c_var < 18.0
+        and float(robust["clahe_vert_edge_score"]) < 0.45
+        and not necktie_ridge
+    ):
         return {**result_meta, "has_tie": False, "reason": "solid_shirt_no_tie"}
 
     # Edges fan outward (V-neckline or open collar) → not a tie
@@ -1030,58 +1409,212 @@ def _analyze_tie_cv(bgr, faces):
         return {**result_meta, "has_tie": False, "reason": "v_neckline"}
 
     # Center looks the same colour as the flanks (zipper, seam, etc.) → not a tie
-    if chroma_diff < 4.0 and blade_contrast < 45.0 and c_var < 22.0:
+    # unless illumination-robust edges show a necktie-width ridge. A zipper is
+    # thinner than that ridge and still fails this gate.
+    if (
+        chroma_diff < 4.0
+        and blade_contrast < 45.0
+        and c_var < 22.0
+        and not (
+            float(robust["clahe_vert_edge_score"]) >= 0.50
+            and necktie_ridge
+            and float(robust["local_l_contrast"]) >= 4.0
+        )
+    ):
         return {**result_meta, "has_tie": False, "reason": "monochrome_garment_feature"}
 
-    # Contrast is lopsided (button line, collar fold, etc.) → not a tie
-    if bilateral_symmetry < 0.45 and blade_contrast < 50.0:
+    # Lopsided contrast is typical of a button line or collar fold, but a
+    # patterned / multi-colored blade is also often left-right uneven. Only
+    # reject when the center is bland *and* not chromatically distinct.
+    if (
+        bilateral_symmetry < 0.45
+        and blade_contrast < 50.0
+        and c_var < 22.0
+        and chroma_diff < 3.5
+    ):
         return {**result_meta, "has_tie": False, "reason": "asymmetric_contrast"}
 
-    # A tie blade has fairly even brightness from top to bottom. If there's
-    # a big light-to-dark jump, it's more likely a V-neckline showing an
-    # undershirt underneath.
-    c_lab_l = c_lab[:, :, 0]  # lightness channel (already computed above)
-    c_rows = c_lab_l.shape[0]
-    vert_gradient = 0.0
-    if c_rows >= 6:
-        top_L = float(np.mean(c_lab_l[:c_rows // 3, :]))
-        bot_L = float(np.mean(c_lab_l[2 * c_rows // 3:, :]))
-        vert_gradient = abs(top_L - bot_L)
-    # Big brightness swing + high texture variance → open collar, not a tie
-    if vert_gradient > 35.0 and c_var > 35.0 and blade_contrast < 55.0:
+    # Big brightness swing + high texture variance → open collar / undershirt,
+    # not a necktie blade. Do not let high mean contrast override this: a
+    # white undershirt against a dark shirt is high-contrast and still not a tie.
+    if vert_gradient > 50.0 and c_var > 30.0:
         return {**result_meta, "has_tie": False, "reason": "v_neckline_luminance_gradient"}
 
-    # Final decision: we only call it a tie if multiple signals agree.
-    # We need good contrast, clear edges, distinct colour, and symmetry.
-    # Thresholds are set conservatively to avoid false positives from
-    # zippers, button lines, and collared shirts.
-    is_tie = (
-        skin_frac <= 0.15
-        and not diverging_edges
-        and bilateral_symmetry >= 0.45
+    # Classic high-contrast solid tie.
+    classic_tie = (
+        bilateral_symmetry >= 0.45
+        and vert_gradient < 50.0
         and (
-            (blade_contrast >= 30.0 and vert_edge_score >= 0.45 and chroma_diff >= 3.0) or
-            (max_flank_contrast >= 45.0 and vert_edge_score >= 0.45) or
-            (blade_contrast >= 30.0 and c_var >= 28.0 and chroma_diff >= 3.0 and vert_gradient < 35.0) or
-            (blade_contrast >= 50.0 and contrast_ratio >= 1.30)
+            (blade_contrast >= 30.0 and vert_edge_score >= 0.45 and chroma_diff >= 3.0)
+            or (max_flank_contrast >= 45.0 and vert_edge_score >= 0.45)
+            or (
+                blade_contrast >= 30.0
+                and c_var >= 28.0
+                and chroma_diff >= 3.0
+            )
+            or (blade_contrast >= 50.0 and contrast_ratio >= 1.30)
+        )
+    )
+    # Patterned / multi-colored / paisley blade: the center column is a
+    # distinct vertical member. Do not require left/right colour symmetry
+    # or a single dominant hue. Fine weaves can have modest pixel variance.
+    patterned_tie = (
+        blade_contrast >= 18.0
+        and chroma_diff >= 3.5
+        and vert_gradient < 40.0
+        and (c_var >= 14.0 or blade_contrast >= 35.0)
+    )
+    # Dark-on-dark / low-contrast: a vertical member with flanking edges,
+    # even when mean colour matches the shirt. CLAHE-on-L is analysis-only.
+    low_contrast_tie = (
+        (
+            vert_edge_score >= 0.55
+            and bilateral_symmetry >= 0.40
+            and blade_contrast >= 8.0
+            and vert_gradient < 50.0
+        )
+        or (
+            float(robust["clahe_vert_edge_score"]) >= 0.50
+            and necktie_ridge
+            and bilateral_symmetry >= 0.35
+            and float(robust["local_l_contrast"]) >= 3.5
+            and vert_gradient < 55.0
+        )
+    )
+    # Upper knot only: the frame cuts through the collar, so there is no
+    # blade to measure. A compact, high-contrast mass in the collar seat
+    # is enough. Do not require chroma, symmetry, or a tall crop.
+    short_collar_crop = ch <= max(36, int(fh * 0.55))
+    knot_only_tie = (
+        short_collar_crop
+        and vert_gradient < 45.0
+        and skin_frac <= 0.15
+        and (
+            blade_contrast >= 22.0
+            or (
+                float(robust["local_l_contrast"]) >= 5.0
+                and float(robust["clahe_vert_edge_score"]) >= 0.40
+            )
         )
     )
 
+    is_tie = (
+        skin_frac <= 0.15
+        and not diverging_edges
+        and (classic_tie or patterned_tie or low_contrast_tie or knot_only_tie)
+    )
+    if is_tie and knot_only_tie and not (classic_tie or patterned_tie or low_contrast_tie):
+        reason = "knot_only_detected"
+    elif is_tie and patterned_tie and not classic_tie:
+        reason = "patterned_tie_detected"
+    elif is_tie and low_contrast_tie and not classic_tie:
+        reason = "low_contrast_tie_detected"
+    elif is_tie:
+        reason = "tie_detected"
+    else:
+        reason = "insufficient_tie_profile"
+
+    result_meta["neckwear_shape"] = _infer_neckwear_shape(
+        result_meta, ch, cw, fh
+    ) if is_tie else ""
     return {
         **result_meta,
         "has_tie": bool(is_tie),
-        "reason": "tie_detected" if is_tie else "insufficient_tie_profile",
+        "reason": reason,
     }
 
 
+def _structural_tie_recovery(bgr, faces, model_version, **detector_meta):
+    """Accept a required tie from collar/chest structure when the box model misses.
+
+    COCO and similar detectors are biased toward solid dark ties. A patterned
+    or low-contrast necktie can be structurally obvious while producing no box.
+    That miss is not proof of absence.
+    """
+    cv_res = detector_meta.pop("cv_result", None)
+    if cv_res is None:
+        cv_res = _analyze_tie_cv(bgr, faces)
+    if not cv_res.get("has_tie"):
+        return None
+    meta = {
+        "decision": "accept",
+        "tie_status": "tie_present",
+        "tie_detected": True,
+        "confidence": round(float(detector_meta.get("confidence") or 0.0), 4),
+        "upper_body_visible": True,
+        "model_version": model_version,
+        "reason": "structural_cv",
+        "cv_reason": cv_res.get("reason"),
+        "corroborated_by_cv": True,
+    }
+    bbox = detector_meta.get("bbox")
+    if bbox is not None:
+        meta["bbox"] = bbox
+    return {
+        "passed": True,
+        "message": "Tie / formal neckwear detected.",
+        "meta": meta,
+    }
+
+
+def _tie_runtime_cache(params):
+    """Return request-local tie evidence storage.
+
+    ``run_checks`` executes criteria sequentially. Keeping this cache in the
+    request's params object avoids a second Faster R-CNN pass when both tie
+    criteria are enabled, while direct callers remain fully supported.
+    """
+    if not isinstance(params, dict):
+        return None
+    return params.setdefault("_runtime_cache", {})
+
+
+def _cached_tie_inference(bgr, roi, params):
+    """Run tie-model inference once for the current image/ROI."""
+    cache = _tie_runtime_cache(params)
+    key = ("tie_inference", id(bgr), tuple(roi))
+    if cache is not None and key in cache:
+        return cache[key]
+
+    roi_x1, roi_y1, roi_x2, roi_y2 = roi
+    roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+    try:
+        detector = get_tie_detector()
+        detection = detector.detect(
+            Image.fromarray(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)),
+            roi_offset=(roi_x1, roi_y1),
+        )
+        value = (detector, detection, None)
+    except Exception as exc:
+        _logger.warning("Tie detector unavailable: %s", exc)
+        value = (None, None, exc)
+
+    if cache is not None:
+        cache[key] = value
+    return value
+
+
+def _cached_structural_tie_analysis(bgr, faces, params):
+    """Share the CPU-only structural tie fallback across tie criteria."""
+    cache = _tie_runtime_cache(params)
+    key = ("tie_structural_cv", id(bgr))
+    if cache is not None and key in cache:
+        return cache[key]
+    value = _analyze_tie_cv(bgr, faces)
+    if cache is not None:
+        cache[key] = value
+    return value
+
+
 def check_tie(bgr, faces, params):
-    """Verify a required tie using calibrated positive evidence only.
+    """Verify a required official necktie using staged evidence.
 
     A one-class object detector can establish *presence* but cannot establish
     *absence*: a missing box could be an open collar, a crop, occlusion, or a
-    model miss.  Therefore only a policy-calibrated, face-relative detection
-    is auto-accepted.  All other cases are explicitly triaged for review,
-    rather than being mislabelled as a no-tie rejection.
+    model miss. Bow ties, scarves, and other non-necktie neckwear never auto-
+    pass. A missing official-design specification cannot be invented; default
+    enforcement is type-only (traditional necktie). Weak or cropped evidence
+    is reviewed, not reported as “no tie”.
     """
     model_version = os.environ.get("TIE_MODEL_VERSION", "tie-detector-dev")
     if not faces:
@@ -1110,72 +1643,82 @@ def check_tie(bgr, faces, params):
             model_version=model_version, visibility_reason=vis.reason,
         )
 
-    try:
-        detector = get_tie_detector()
-    except Exception as exc:
-        _logger.warning("Tie detector unavailable: %s", exc)
-        return _tie_manual_review(
-            "Tie detection is temporarily unavailable. Manual review is required.",
-            status="uncertain", visible=True, model_version=model_version,
-            error="model_unavailable",
-        )
-
-    roi_x1, roi_y1, roi_x2, roi_y2 = vis.roi
-    roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
-    detection = detector.detect(
-        Image.fromarray(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)),
-        roi_offset=(roi_x1, roi_y1),
+    detector, detection, detector_error = _cached_tie_inference(
+        bgr, vis.roi, params
     )
+    policy = load_official_tie_policy(params)
+    cv_res = _cached_structural_tie_analysis(bgr, faces, params)
+
+    if detector_error is not None:
+        fallback_type = classify_neckwear_type(
+            cv_res=cv_res,
+            bbox=None,
+            face=face,
+            image_hw=(h, w),
+            visibility_reason=vis.reason,
+            detection_valid=False,
+        )
+        return decide_require_tie(
+            policy=policy,
+            cv_res=cv_res,
+            detection_valid=False,
+            detection_confidence=0.0,
+            threshold=0.65,
+            localization_reason=None,
+            visibility_reason=vis.reason,
+            visibility_sufficient=True,
+            neckwear_type=fallback_type,
+            official_match="unspecified",
+            supports_absence=False,
+            model_version=model_version,
+            detector_available=False,
+        )
+
     threshold, geometry, model_version = _tie_positive_policy(detector, params)
-
-    if detection is None:
-        if getattr(detector, "supports_absence_decision", False) is True:
-            return _tie_absent_result(model_version, reason="no_valid_detection")
-        return _tie_manual_review(
-            "No reliable tie detection was produced. Manual review is required.",
-            status="uncertain", visible=True, model_version=model_version,
-            reason="no_valid_detection", confidence=0.0,
+    bbox = None
+    bbox_tuple = None
+    detection_valid = False
+    localization_reason = None
+    confidence = 0.0
+    if detection is not None:
+        confidence = float(detection.confidence)
+        bbox_tuple = tuple(detection.bbox)
+        bbox = {key: int(value) for key, value in zip(("x1", "y1", "x2", "y2"), detection.bbox)}
+        detection_valid, localization_reason = validate_tie_detection(
+            detection, face, w, h, geometry
         )
+    else:
+        bbox_tuple = None
 
-    bbox = {key: int(value) for key, value in zip(("x1", "y1", "x2", "y2"), detection.bbox)}
-    valid, reason = validate_tie_detection(detection, face, w, h, geometry)
-    if not valid:
-        if getattr(detector, "supports_absence_decision", False) is True:
-            return _tie_absent_result(
-                model_version, reason=reason, confidence=detection.confidence, bbox=bbox,
-            )
-        return _tie_manual_review(
-            "Tie-like object is outside the expected neck/chest region. Manual review is required.",
-            status="uncertain", visible=True, model_version=model_version,
-            reason=reason, confidence=round(detection.confidence, 4), bbox=bbox,
-        )
-    if detection.confidence < threshold:
-        if getattr(detector, "supports_absence_decision", False) is True:
-            return _tie_absent_result(
-                model_version, reason="below_positive_threshold",
-                confidence=detection.confidence, bbox=bbox,
-            )
-        return _tie_manual_review(
-            "Tie detection confidence is below the calibrated auto-approval level. Manual review is required.",
-            status="uncertain", visible=True, model_version=model_version,
-            reason="below_calibrated_positive_threshold",
-            confidence=round(detection.confidence, 4), bbox=bbox,
-            tie_present_threshold=threshold,
-        )
+    neckwear_type = classify_neckwear_type(
+        cv_res=cv_res,
+        bbox=bbox_tuple,
+        face=face,
+        image_hw=(h, w),
+        visibility_reason=vis.reason,
+        detection_valid=detection_valid,
+    )
+    appearance_stats = measure_appearance(bgr, bbox_tuple)
+    official_match = match_official_appearance(appearance_stats, policy)
+    if official_match == "mismatch" and neckwear_type == "necktie":
+        neckwear_type = "unofficial_tie"
 
-    return {
-        "passed": True,
-        "message": "Tie / formal neckwear detected.",
-        "meta": {
-            "decision": "accept",
-            "tie_status": "tie_present",
-            "tie_detected": True,
-            "confidence": round(detection.confidence, 4),
-            "upper_body_visible": True,
-            "bbox": bbox,
-            "model_version": model_version,
-        },
-    }
+    return decide_require_tie(
+        policy=policy,
+        cv_res=cv_res,
+        detection_valid=bool(detection_valid),
+        detection_confidence=confidence,
+        threshold=threshold,
+        localization_reason=localization_reason if detection is not None else None,
+        visibility_reason=vis.reason,
+        visibility_sufficient=True,
+        neckwear_type=neckwear_type,
+        official_match=official_match,
+        supports_absence=getattr(detector, "supports_absence_decision", False) is True,
+        model_version=model_version,
+        bbox=bbox,
+        detector_available=True,
+    )
 
 
 # ---------- Learned Tie Detector (no_tie criterion) ----------
@@ -1249,13 +1792,11 @@ def check_no_tie(bgr, faces, params):
             },
         }
 
-    roi_x1, roi_y1, roi_x2, roi_y2 = vis.roi
-
     # --- Attempt to load the learned detector ---
-    try:
-        detector = get_tie_detector()
-    except (FileNotFoundError, Exception) as exc:
-        _logger.warning("Tie detector unavailable: %s", exc)
+    detector, detection, detector_error = _cached_tie_inference(
+        bgr, vis.roi, params
+    )
+    if detector_error is not None:
         return {
             "passed": False,
             "message": (
@@ -1272,13 +1813,6 @@ def check_no_tie(bgr, faces, params):
             },
         }
 
-    # Crop ROI and run detector
-    roi_bgr = bgr[roi_y1:roi_y2, roi_x1:roi_x2]
-    roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-    roi_pil = Image.fromarray(roi_rgb)
-
-    detection = detector.detect(roi_pil, roi_offset=(roi_x1, roi_y1))
-
     # Apply the same face-relative localization guard used by require_tie.
     # A high detector score on a lapel, necklace, background pattern, or a
     # second person must never be treated as a visible tie.
@@ -1288,6 +1822,28 @@ def check_no_tie(bgr, faces, params):
         model_version = policy_version
 
     if detection is None:
+        cv_res = _cached_structural_tie_analysis(bgr, faces, params)
+        if cv_res.get("has_tie"):
+            return {
+                "passed": False,
+                "message": "Visible necktie detected in the upper-body region.",
+                "meta": {
+                    "decision": "reject",
+                    "tie_status": "tie_present",
+                    "tie_detected": True,
+                    "confidence": 0.0,
+                    "upper_body_visible": True,
+                    "corroborated_by_cv": True,
+                    "cv_reason": cv_res.get("reason"),
+                    "model_version": model_version,
+                },
+            }
+        if getattr(detector, "supports_absence_decision", False) is not True:
+            return _tie_manual_review(
+                "No reliable tie absence decision was produced. Manual review is required.",
+                status="uncertain", visible=True, model_version=model_version,
+                reason="absence_not_supported", confidence=0.0,
+            )
         return {
             "passed": True,
             "message": (
@@ -1337,6 +1893,23 @@ def check_no_tie(bgr, faces, params):
         }
 
     if conf <= accept_threshold:
+        cv_res = _cached_structural_tie_analysis(bgr, faces, params)
+        if cv_res.get("has_tie"):
+            return {
+                "passed": False,
+                "message": "Visible necktie detected in the upper-body region.",
+                "meta": {
+                    "decision": "reject",
+                    "tie_status": "tie_present",
+                    "tie_detected": True,
+                    "confidence": round(conf, 4),
+                    "upper_body_visible": True,
+                    "bbox": bbox_dict,
+                    "corroborated_by_cv": True,
+                    "cv_reason": cv_res.get("reason"),
+                    "model_version": model_version,
+                },
+            }
         return {
             "passed": True,
             "message": (
@@ -1355,7 +1928,7 @@ def check_no_tie(bgr, faces, params):
         }
 
     # --- Uncertain band: cross-check with CV heuristic for corroboration ---
-    cv_res = _analyze_tie_cv(bgr, faces)
+    cv_res = _cached_structural_tie_analysis(bgr, faces, params)
     if cv_res["has_tie"]:
         # Both signals agree: tie is present → reject
         return {
@@ -1500,7 +2073,11 @@ def check_head_pose(bgr, faces, params):
     """Uses face mesh to estimate whether head is tilted/turned too much."""
     pts = _face_mesh_landmarks(bgr)
     if pts is None:
-        return {"passed": True, "message": "Head pose check skipped (landmarks unavailable).", "meta": {}}
+        return {
+            "passed": False,
+            "message": "Head pose could not be verified. Manual review is required.",
+            "meta": {"decision": "manual_review", "error": "landmarks_unavailable"},
+        }
 
     # Landmark indices: left eye outer (33), right eye outer (263), nose tip (1), chin (152)
     try:
@@ -1509,7 +2086,11 @@ def check_head_pose(bgr, faces, params):
         nose = np.array(pts[1])
         chin = np.array(pts[152])
     except IndexError:
-        return {"passed": True, "message": "Head pose check skipped.", "meta": {}}
+        return {
+            "passed": False,
+            "message": "Head pose could not be verified. Manual review is required.",
+            "meta": {"decision": "manual_review", "error": "landmarks_incomplete"},
+        }
 
     dx = right_eye[0] - left_eye[0]
     dy = right_eye[1] - left_eye[1]
@@ -1539,7 +2120,11 @@ def check_head_pose(bgr, faces, params):
 def check_eyes_open(bgr, faces, params):
     pts = _face_mesh_landmarks(bgr)
     if pts is None:
-        return {"passed": True, "message": "Eyes-open check skipped (landmarks unavailable).", "meta": {}}
+        return {
+            "passed": False,
+            "message": "Eyes could not be verified. Manual review is required.",
+            "meta": {"decision": "manual_review", "error": "landmarks_unavailable"},
+        }
     try:
         # Left eye vertical landmarks: 159 (top), 145 (bottom); horizontal: 33,133
         top = np.array(pts[159]); bottom = np.array(pts[145])
@@ -1548,7 +2133,11 @@ def check_eyes_open(bgr, faces, params):
         horiz = np.linalg.norm(left - right) + 1e-6
         ear = vert / horiz
     except IndexError:
-        return {"passed": True, "message": "Eyes-open check skipped.", "meta": {}}
+        return {
+            "passed": False,
+            "message": "Eyes could not be verified. Manual review is required.",
+            "meta": {"decision": "manual_review", "error": "landmarks_incomplete"},
+        }
 
     threshold = params.get("eye_open_ratio", 0.15)
     if ear < threshold:
@@ -1589,9 +2178,10 @@ CHECK_LABELS = {
     "eyes_open": "Eyes Open",
 }
 
-# Criteria whose individual failure always blocks an overall pass, regardless
-# of the pass-count gate (enforced explicitly inside run_checks).
-_MANDATORY_CRITERIA = frozenset({"white_background", "no_tie", "require_tie"})
+# Every criterion enabled by the university policy is a requirement for an
+# automatic admissions-photo pass. A pass-count threshold must not hide a
+# failed face, framing, quality, or lighting check.
+_MANDATORY_CRITERIA = frozenset(CHECK_REGISTRY)
 
 
 def _is_mandatory(key):
@@ -1604,32 +2194,32 @@ def run_checks(image_bytes, enabled_criteria, params=None):
     enabled_criteria: dict {criteria_key: bool}
     params: dict of tunable numeric parameters (optional, merges with defaults)
 
-    Soft-failure policy
-    -------------------
-    When ``no_blur`` produces a ``"soft"`` severity and ``blur_soft_fail`` is
-    enabled, the blur check is treated as a conditional pass if the primary
-    compliance check (``white_background``) independently passed.  This
-    prevents a moderately blurred but genuinely white-background photo from
-    being rejected due to the pass-count gate.
-
-    Masked-failure policy
-    ---------------------
-    By default the overall verdict uses a pass-count gate, so individually
-    failed non-mandatory checks can be hidden by enough passing checks.  The
-    response therefore always reports those hidden checks under
-    ``masked_failures``.  Setting ``params["strict_all_criteria"]`` enables
-    strict mode, in which any failed enabled criterion (except a
-    soft-promoted blur) blocks the overall pass.
+    All-enabled-criteria policy
+    ----------------------------
+    Every enabled criterion is a hard requirement for automatic approval.
+    ``min_pass_criteria`` and the legacy ``strict_all_criteria`` parameter are
+    retained for request/response compatibility, but cannot override a failed
+    enabled requirement.
     """
-    params = params or {}
+    # Keep runtime evidence (including the tie cache) isolated to this request;
+    # callers may reuse their configuration dictionary across submissions.
+    params = dict(params or {})
     started_at = time.perf_counter()
     try:
         bgr = _load_image(image_bytes)
-    except Exception as e:
+    except ImageValidationError as exc:
         return {
             "overall_passed": False,
-            "error": f"Could not read image: {str(e)}",
-            "results": {}
+            "error": str(exc),
+            "results": {},
+        }
+    except Exception:
+        # Never surface decoder internals to the caller.
+        _logger.exception("Unexpected failure while decoding uploaded image.")
+        return {
+            "overall_passed": False,
+            "error": "Could not read image.",
+            "results": {},
         }
 
     decoded_at = time.perf_counter()
@@ -1649,19 +2239,26 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         check_started_at = time.perf_counter()
         try:
             res = fn(bgr, faces, params)
-        except Exception as e:
-            res = {"passed": False, "message": f"Check '{key}' failed to run: {str(e)}", "meta": {}}
+        except Exception:
+            # A single failing check must not abort the whole verification,
+            # but its internals must not reach the student-facing response.
+            _logger.exception("Check '%s' raised an unexpected error.", key)
+            res = {
+                "passed": False,
+                "message": "This check could not be completed. Manual review is required.",
+                "meta": {"error": "check_failed"},
+            }
         check_timings_ms[key] = round((time.perf_counter() - check_started_at) * 1000.0, 3)
         res["label"] = CHECK_LABELS.get(key, key)
         results[key] = res
         if res.get("passed"):
             passed_count += 1
 
-    # Blur soft-failure: if sharpness is slightly low but white background passed, allow conditional pass
+    # Report soft blur separately, but never turn a failed enabled quality
+    # requirement into a pass.
     quality_notes = []
     blur_result = results.get("no_blur", {})
     bg_result = results.get("white_background", {})
-    blur_soft_promoted = False
 
     if (
         enabled_criteria.get("no_blur")
@@ -1671,59 +2268,29 @@ def run_checks(image_bytes, enabled_criteria, params=None):
     ):
         bg_passed = bg_result.get("passed", True) if enabled_criteria.get("white_background") else True
         if bg_passed:
-            passed_count += 1
-            blur_soft_promoted = True
-            results["no_blur"]["soft_promoted"] = True
             quality_notes.append(
-                "Sharpness is below the ideal threshold but the background "
-                "is confirmed white; blur soft-failure was conditionally "
-                "accepted."
+                "Sharpness is below the ideal threshold; manual review or retake is required."
             )
 
     total_criteria = len(ordered_keys)
-    strict_mode = bool(int(params.get("strict_all_criteria", 0)))
+    # Legacy pass-count/strictness inputs remain accepted but are no longer
+    # allowed to approve a photo that failed an enabled criterion.
+    strict_mode = True
 
-    try:
-        min_required_param = max(0, int(params.get("min_pass_criteria", 4)))
-    except (TypeError, ValueError):
-        min_required_param = 4 
-
-    # Failures hidden by the pass-count gate (F1): enabled checks that did not
-    # pass but can be masked by enough other passing checks.  A soft-promoted
-    # blur check was already conditionally accepted, so it is not masked.
+    # No failure is maskable under the admissions policy.
     masked_failures = [
         key for key, res in results.items()
-        if enabled_criteria.get(key) and not res.get("passed") and not res.get("soft_promoted")
-    ]
-    overall_passed = overall_passed and not masked_failures # strict mode
-    response["masked_failures"] = masked_failures if not strict_mode else [
-        key for key in masked_failures
-        if not _is_mandatory(k)  # preserve legacy when strict_mode=False
+        if enabled_criteria.get(key) and not res.get("passed")
     ]
 
     if total_criteria == 0:
         overall_passed = True
         required_to_pass = 0
     else:
-        required_to_pass = min(min_required_param, total_criteria)
-        overall_passed = (passed_count >= required_to_pass)
-
-        # Mandatory requirements: failing any of these blocks overall pass
-        if enabled_criteria.get("white_background") and not bg_result.get("passed", False):
-            overall_passed = False
-
-        no_tie_result = results.get("no_tie", {})
-        if enabled_criteria.get("no_tie") and not no_tie_result.get("passed", False):
-            overall_passed = False
-
-        require_tie_result = results.get("require_tie", {})
-        if enabled_criteria.get("require_tie") and not require_tie_result.get("passed", False):
-            overall_passed = False
-
-        if strict_mode:
-            # Strict mode: the pass-count gate alone can never approve a photo
-            # while an individually enabled criterion has failed.
-            overall_passed = overall_passed and not masked_failures
+        required_to_pass = total_criteria
+        # Exact-one-face is a prerequisite even if a caller accidentally omits
+        # the single_face criterion from its enabled map.
+        overall_passed = passed_count == total_criteria and len(faces) == 1
 
     completed_at = time.perf_counter()
     response = {
@@ -1731,11 +2298,8 @@ def run_checks(image_bytes, enabled_criteria, params=None):
         "passed_count": passed_count,
         "total_criteria": total_criteria,
         "required_to_pass": required_to_pass,
-        "masked_failures": (
-            []
-            if strict_mode
-            else [key for key in masked_failures if not _is_mandatory(key)]
-        ),
+        "masked_failures": [],
+        "failed_criteria": masked_failures,
         "results": results,
         "image_info": {
             "width": int(bgr.shape[1]),

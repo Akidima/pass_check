@@ -58,11 +58,17 @@ $sharpness = (float)($input['sharpness'] ?? 1.0);
 $bgColor = trim($input['bg_color'] ?? '');
 
 $serviceUrl = rtrim(get_setting('python_service_url', 'http://127.0.0.1:5001'), '/') . '/edit-photo';
+$serviceToken = getenv('PORTAL_SHARED_SECRET');
+if ($serviceToken === false || $serviceToken === '') {
+    json_response(['error' => 'Verification service is not configured (missing PORTAL_SHARED_SECRET).'], 503);
+}
 
 $mime = mime_content_type($filePath) ?: 'image/jpeg';
 $cfile = new CURLFile($filePath, $mime, basename($filePath));
 
 $isCutout = !empty($input['get_cutout']);
+$isPreview = !empty($input['preview']);
+$wantsBackground = $bgColor !== '';
 
 $postFields = [
     'photo' => $cfile,
@@ -74,7 +80,7 @@ if ($isCutout) {
     $postFields['get_cutout'] = '1';
 }
 
-if (!empty($bgColor)) {
+if ($wantsBackground) {
     $postFields['bg_color'] = $bgColor;
 }
 
@@ -88,17 +94,17 @@ curl_setopt_array($ch, [
     CURLOPT_POST => true,
     CURLOPT_POSTFIELDS => $postFields,
     CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 30,
+    CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $serviceToken],
+    CURLOPT_CONNECTTIMEOUT => 5,
+    CURLOPT_TIMEOUT => 60,
 ]);
 
 $editedBytes = curl_exec($ch);
 $curlErrno = curl_errno($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
 if (PHP_VERSION_ID < 80000) {
     curl_close($ch);
 }
-
-$isPreview = !empty($input['preview']);
 
 if (!$curlErrno && $httpCode === 200 && !empty($editedBytes)) {
     if ($isCutout) {
@@ -117,7 +123,6 @@ if (!$curlErrno && $httpCode === 200 && !empty($editedBytes)) {
             'id' => $id,
         ]);
     }
-    // Overwrite the original image file with the edited version
     file_put_contents($filePath, $editedBytes);
     json_response([
         'success' => true,
@@ -126,6 +131,22 @@ if (!$curlErrno && $httpCode === 200 && !empty($editedBytes)) {
         'id' => $id,
         'timestamp' => time()
     ]);
+}
+
+$pythonError = null;
+if (is_string($editedBytes) && $editedBytes !== '') {
+    $decoded = json_decode($editedBytes, true);
+    if (is_array($decoded) && !empty($decoded['error'])) {
+        $pythonError = (string)$decoded['error'];
+    }
+}
+
+// GD cannot isolate a subject. Do not pretend a background change succeeded.
+if ($isCutout || $wantsBackground) {
+    json_response([
+        'error' => $pythonError
+            ?: ('Background replacement failed (HTTP ' . ($httpCode ?: 0) . '). Check that the Python service is running and PORTAL_SHARED_SECRET matches.'),
+    ], 502);
 }
 
 // Fallback to PHP GD if Python service is unreachable

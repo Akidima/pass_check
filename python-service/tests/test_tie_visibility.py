@@ -32,25 +32,38 @@ class TestUpperBodyVisibility(unittest.TestCase):
         self.assertLessEqual(x2, 500)
         self.assertLessEqual(y2, 700)
 
-    def test_roi_starts_below_face(self):
-        """The ROI y1 should start at or below the face bottom."""
+    def test_roi_includes_collar_seat(self):
+        """The ROI must start above the face bottom so the knot is in-crop."""
         face = {"x": 100, "y": 50, "w": 150, "h": 200}
         result = self.estimator.estimate(face, image_width=400, image_height=600)
         self.assertTrue(result.sufficient)
-        _, y1, _, _ = result.roi
+        _, y1, _, y2 = result.roi
         face_bottom = face["y"] + face["h"]
-        self.assertGreaterEqual(y1, face_bottom)
+        self.assertLess(y1, face_bottom)
+        self.assertGreater(y2, face_bottom)
 
     # --- Insufficient visibility ---
 
     def test_insufficient_visibility_tight_crop(self):
-        """Image ends right below the face — no chest visible."""
+        """Image ends at the chin — no collar/knot band visible."""
         face = {"x": 50, "y": 20, "w": 100, "h": 120}
-        # Face bottom = 140, image height = 160 → only 20px below face
-        # Required = 1.25 * 120 = 150px
-        result = self.estimator.estimate(face, image_width=200, image_height=160)
+        # Face bottom = 140, image height = 145 → only 5px below the chin
+        result = self.estimator.estimate(face, image_width=200, image_height=145)
         self.assertFalse(result.sufficient)
         self.assertIn("insufficient", result.reason.lower())
+
+    def test_collar_knot_band_is_sufficient(self):
+        """A crop that shows the knot but not the blade is still analyzable."""
+        estimator = UpperBodyVisibilityEstimator(
+            min_face_height_px=80,
+            min_visible_below_face_ratio=0.35,
+            horizontal_face_padding=0.85,
+        )
+        face = {"x": 100, "y": 80, "w": 200, "h": 200}
+        # Face bottom = 280; 0.12 * 200 = 24px of collar is enough for a knot
+        result = estimator.estimate(face, image_width=400, image_height=310)
+        self.assertTrue(result.sufficient)
+        self.assertIn("collar/knot", result.reason.lower())
 
     def test_face_at_bottom_edge(self):
         """Face is at the very bottom — no visible area below."""

@@ -52,6 +52,13 @@ php-app/uploads/*
 !php-app/uploads/.gitkeep
 test_curl.jpg
 python-service/try.txt
+python-service/training-data/*
+!python-service/training-data/.gitkeep
 
 # Logs
 *.log
+python-service/COMMANDS.md
+PYTHON_SERVICE_RESEARCH_AND_PRODUCTION_RECOMMENDATIONS.md
+RESEARCH_RECOMMENDATIONS.md
+python-service/DEPLOY.md
+python-service/SECURITY_AUDIT.md

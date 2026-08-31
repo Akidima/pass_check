@@ -21,6 +21,10 @@ Environment variables
     TIE_DETECTOR_BACKEND      ``auto`` (default), ``custom``, or ``coco``
     TIE_COCO_THRESHOLD        calibrated operating point for the COCO fallback
                               (default 0.50)
+    TIE_INPUT_MIN_SIZE        shorter-side target for the detector's input
+                              transform (default 640)
+    TIE_INPUT_MAX_SIZE        longer-side cap for the detector's input
+                              transform (default 1067)
 
 Production readiness
 ~~~~~~~~~~~~~~~~~~~~
@@ -37,6 +41,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -44,6 +49,106 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Detector input-resolution budget
+# ---------------------------------------------------------------------------
+# torchvision's detection models resize every input so the shorter side is
+# `min_size`, unless that would push the longer side past `max_size`. The
+# defaults (800/1333) were chosen for full COCO photographs, but this detector
+# is handed a wide, shallow upper-body ROI — measured sizes on real submissions
+# range from 174x62 to about 490x250. Against those, the default transform
+# UPSCALES by 2x to 8x, so most of the inference cost is spent on interpolated
+# pixels that carry no additional detail.
+#
+# torchvision's min_size is a TARGET, not a cap: it UPSCALES any shorter side
+# below that value. Chest ROIs are already small (often ~250 px high), so a
+# COCO-style min_size of 800 spends most of the 8–15 s budget on interpolated
+# pixels. Default min_size=32 means "do not upscale". max_size=640 caps the
+# longer side. Boxes are mapped back to the original ROI.
+#
+# Restore torchvision's defaults with TIE_INPUT_MIN_SIZE=800 TIE_INPUT_MAX_SIZE=1333
+# after re-running benchmarks/verify_tie_resolution_equivalence.py.
+DEFAULT_INPUT_MIN_SIZE = 32
+DEFAULT_INPUT_MAX_SIZE = 1024
+
+
+def _int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Read a bounded integer environment variable, falling back on bad input."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %s.", name, raw, default)
+        return default
+    if not minimum <= value <= maximum:
+        logger.warning(
+            "%s=%s outside [%s, %s]; using default %s.",
+            name, value, minimum, maximum, default,
+        )
+        return default
+    return value
+
+
+def input_size_budget() -> tuple[int, int]:
+    """Return the (min_size, max_size) transform budget for the detectors."""
+    min_size = _int_env(
+        "TIE_INPUT_MIN_SIZE", DEFAULT_INPUT_MIN_SIZE, minimum=1, maximum=2000
+    )
+    max_size = _int_env(
+        "TIE_INPUT_MAX_SIZE", DEFAULT_INPUT_MAX_SIZE, minimum=128, maximum=4000
+    )
+    if max_size < min_size:
+        logger.warning(
+            "TIE_INPUT_MAX_SIZE (%s) is below TIE_INPUT_MIN_SIZE (%s); using defaults.",
+            max_size, min_size,
+        )
+        return DEFAULT_INPUT_MIN_SIZE, DEFAULT_INPUT_MAX_SIZE
+    return min_size, max_size
+
+
+def _fit_longest_side(image: Image.Image, max_side: int) -> tuple[Image.Image, float]:
+    """Downscale so the longer side is at most ``max_side``.
+
+    Returns the image and a multiplier that maps detection boxes back into
+    the original pixel space. 1.0 means no resize.
+    """
+    width, height = image.size
+    longest = max(width, height)
+    if max_side < 1 or longest <= max_side:
+        return image, 1.0
+    scale = max_side / float(longest)
+    resized = image.resize(
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        Image.BILINEAR,
+    )
+    return resized, 1.0 / scale
+
+
+def _float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    """Read a bounded float environment variable.
+
+    A misconfigured threshold silently changes production decisions, so an
+    out-of-range or non-numeric value is rejected loudly instead of being
+    coerced into something arbitrary.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {raw!r}.")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {raw!r}.")
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}, got {value}."
+        )
+    return value
 
 
 # ---------- Data Structures ----------
@@ -302,7 +407,7 @@ class TorchTieDetector:
         bx1: float, by1: float, bx2: float, by2: float,
         roi_w: int, roi_h: int,
         *,
-        min_aspect_ratio: float = 1.2,
+        min_aspect_ratio: float = 0.55,
         max_aspect_ratio: float = 12.0,
         min_area_frac: float = 0.005,
         max_area_frac: float = 0.50,
@@ -323,7 +428,8 @@ class TorchTieDetector:
         roi_w, roi_h : int
             Dimensions of the ROI image.
         min_aspect_ratio : float
-            Minimum height/width ratio (ties are taller than wide).
+            Minimum height/width ratio. An upper-knot box is often wider
+            than it is tall, so this is well below 1.0 on purpose.
         max_aspect_ratio : float
             Maximum height/width ratio (rejects single-pixel-wide slivers).
         min_area_frac : float
@@ -373,7 +479,11 @@ class TorchTieDetector:
         roi_w, roi_h = rgb_image.size
         tensor = self._to_tensor(rgb_image).to(self.device)
 
-        with torch.no_grad():
+        # Deliberately NOT subject to TIE_INPUT_MIN_SIZE/MAX_SIZE. A custom
+        # checkpoint's threshold is calibrated at the resolution it was trained
+        # and evaluated at, so changing its input transform here would silently
+        # invalidate the policy file's operating point.
+        with torch.inference_mode():
             outputs = self._model([tensor])[0]
 
         boxes = outputs["boxes"]
@@ -439,9 +549,9 @@ class CocoTieDetector:
         self.version = "torchvision-fasterrcnn-resnet50-fpn-v2-coco"
         self.device = torch.device(device)
         self.raw_threshold = raw_threshold
-        self.positive_threshold = float(os.environ.get("TIE_COCO_THRESHOLD", "0.50"))
-        if not 0.0 < self.positive_threshold < 1.0:
-            raise ValueError("TIE_COCO_THRESHOLD must be between 0 and 1.")
+        self.positive_threshold = _float_env(
+            "TIE_COCO_THRESHOLD", 0.50, minimum=0.01, maximum=0.99
+        )
         # Unlike an unvalidated one-class checkpoint, this COCO model was
         # trained with background examples.  A sufficient-visibility ROI with
         # no valid tie box is therefore an operational no-tie decision.
@@ -449,17 +559,25 @@ class CocoTieDetector:
         self.geometry = {
             "min_width_face_ratio": 0.04,
             "max_width_face_ratio": 0.85,
-            "min_height_face_ratio": 0.12,
+            "min_height_face_ratio": 0.06,
             "max_height_face_ratio": 1.60,
-            "min_top_offset_face_ratio": -0.30,
+            "min_top_offset_face_ratio": -0.45,
             "max_top_offset_face_ratio": 1.35,
-            "max_center_offset_face_ratio": 0.35,
+            "max_center_offset_face_ratio": 0.40,
         }
 
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
-        self._model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(self.device).eval()
+        self.input_min_size, self.input_max_size = input_size_budget()
+        self._model = fasterrcnn_resnet50_fpn_v2(
+            weights=weights,
+            min_size=self.input_min_size,
+            max_size=self.input_max_size,
+        ).to(self.device).eval()
         self._to_tensor = torchvision.transforms.ToTensor()
-        logger.info("CocoTieDetector loaded on %s", device)
+        logger.info(
+            "CocoTieDetector loaded on %s (input budget %dx%d, positive threshold %.2f)",
+            device, self.input_min_size, self.input_max_size, self.positive_threshold,
+        )
 
     def detect(
         self,
@@ -470,8 +588,11 @@ class CocoTieDetector:
 
         rgb_image = image.convert("RGB")
         roi_w, roi_h = rgb_image.size
-        tensor = self._to_tensor(rgb_image).to(self.device)
-        with torch.no_grad():
+        infer_image, box_scale = _fit_longest_side(rgb_image, self.input_max_size)
+        tensor = self._to_tensor(infer_image).to(self.device)
+        # inference_mode is strictly cheaper than no_grad: it also skips
+        # version-counter bookkeeping. Numerically identical.
+        with torch.inference_mode():
             outputs = self._model([tensor])[0]
 
         mask = (
@@ -486,6 +607,10 @@ class CocoTieDetector:
         for idx in scores.argsort(descending=True):
             score = float(scores[idx])
             bx1, by1, bx2, by2 = boxes[idx].tolist()
+            bx1, by1, bx2, by2 = (
+                bx1 * box_scale, by1 * box_scale,
+                bx2 * box_scale, by2 * box_scale,
+            )
             if not TorchTieDetector._is_plausible_tie_bbox(bx1, by1, bx2, by2, roi_w, roi_h):
                 continue
             ox, oy = roi_offset
@@ -495,13 +620,15 @@ class CocoTieDetector:
 
 # ---------- Cached Loader ----------
 
-@lru_cache(maxsize=1)
-def get_tie_detector() -> TieDetector:
-    """Return a cached ``TorchTieDetector`` instance.
+# Serialises first-time model construction. ``lru_cache`` memoises the result
+# but does not prevent two threads (e.g. the warm-up thread and a first
+# request) from both entering the loader and building the model twice.
+_DETECTOR_LOCK = threading.Lock()
 
-    Reads configuration from environment variables.  Raises
-    ``FileNotFoundError`` if the model checkpoint does not exist.
-    """
+
+@lru_cache(maxsize=1)
+def _build_tie_detector() -> TieDetector:
+    """Construct the configured detector. Cached to one instance per worker."""
     backend = os.environ.get("TIE_DETECTOR_BACKEND", "auto").strip().lower()
     if backend not in {"auto", "custom", "coco"}:
         raise ValueError("TIE_DETECTOR_BACKEND must be 'auto', 'custom', or 'coco'.")
@@ -510,10 +637,19 @@ def get_tie_detector() -> TieDetector:
         "TIE_MODEL_POLICY_PATH", f"{os.path.splitext(model_path)[0]}.policy.json"
     )
     device = os.environ.get("TIE_MODEL_DEVICE", "cpu")
-    raw_threshold = float(os.environ.get("TIE_MODEL_RAW_THRESHOLD", "0.05"))
+    raw_threshold = _float_env(
+        "TIE_MODEL_RAW_THRESHOLD", 0.05, minimum=0.0, maximum=1.0
+    )
     version = os.environ.get("TIE_MODEL_VERSION", "tie-detector-dev")
 
     if backend == "coco" or (backend == "auto" and not os.path.isfile(model_path)):
+        if backend == "auto":
+            logger.warning(
+                "TIE_DETECTOR_BACKEND=auto and no custom checkpoint at '%s'; "
+                "falling back to the generic COCO detector. Set the backend "
+                "explicitly in production so behaviour cannot change silently.",
+                model_path,
+            )
         return CocoTieDetector(device=device, raw_threshold=raw_threshold)
 
     if not os.path.isfile(model_path):
@@ -530,3 +666,20 @@ def get_tie_detector() -> TieDetector:
         version=version,
         policy=policy,
     )
+
+
+def get_tie_detector() -> TieDetector:
+    """Return the cached detector, building it at most once per worker.
+
+    Reads configuration from environment variables.  Raises
+    ``FileNotFoundError`` if a required model checkpoint does not exist, and
+    ``TieModelPolicyError`` if a custom checkpoint fails its deployment policy.
+    """
+    with _DETECTOR_LOCK:
+        return _build_tie_detector()
+
+
+# Preserve the cache-management API used by the test suite and by operational
+# reload tooling.
+get_tie_detector.cache_clear = _build_tie_detector.cache_clear
+get_tie_detector.cache_info = _build_tie_detector.cache_info

@@ -103,6 +103,7 @@ include __DIR__ . '/../includes/header.php';
         <!-- Live Preview Canvas / Image -->
         <div class="preview-box">
           <div class="preview-label">Passport Photo Preview</div>
+          <div id="editStatus" class="edit-status" hidden></div>
           <div class="passport-frame">
             <div class="img-container">
               <canvas id="editorCanvas"></canvas>
@@ -282,6 +283,13 @@ include __DIR__ . '/../includes/header.php';
   flex-direction: column;
   align-items: center;
 }
+.edit-status {
+  font-size: 12px;
+  color: #fbbf24;
+  margin: 0 0 10px;
+  text-align: center;
+}
+.edit-status.error { color: #f87171; }
 .preview-label {
   font-size: 11px;
   color: var(--ink-500);
@@ -392,7 +400,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const editBgColor = document.getElementById('editBgColor');
   const bgColorPicker = document.getElementById('bgColorPicker');
+  const editStatus = document.getElementById('editStatus');
   const swatches = document.querySelectorAll('.swatch');
+
+  function setEditStatus(message, isError) {
+    if (!editStatus) return;
+    if (!message) {
+      editStatus.hidden = true;
+      editStatus.textContent = '';
+      editStatus.classList.remove('error');
+      return;
+    }
+    editStatus.hidden = false;
+    editStatus.textContent = message;
+    editStatus.classList.toggle('error', !!isError);
+  }
 
   function setBgColor(color) {
     editBgColor.value = color;
@@ -419,6 +441,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     activeCutoutController = new AbortController();
     cutoutLoading = true;
+    setEditStatus('Isolating subject for background replacement…');
     try {
       const resp = await fetch('edit_photo.php', {
         method: 'POST',
@@ -429,25 +452,33 @@ document.addEventListener('DOMContentLoaded', () => {
           get_cutout: true
         })
       });
-      const resData = await resp.json();
-      if (resData.success && resData.cutout_url && editSubmissionId.value == id) {
+      let resData = null;
+      try { resData = await resp.json(); } catch (e) { resData = null; }
+      if (resData && resData.success && resData.cutout_url && editSubmissionId.value == id) {
         const img = new Image();
         img.onload = () => {
           if (editSubmissionId.value == id) {
             cutoutImage = img;
             cutoutLoading = false;
+            setEditStatus('');
             if (editBgColor.value) {
               updateLivePreview();
             }
           }
         };
+        img.onerror = () => {
+          cutoutLoading = false;
+          setEditStatus('Cutout image could not be displayed.', true);
+        };
         img.src = resData.cutout_url;
       } else {
         cutoutLoading = false;
+        setEditStatus((resData && resData.error) || 'Background cutout failed.', true);
       }
     } catch (err) {
       if (err.name !== 'AbortError') {
         cutoutLoading = false;
+        setEditStatus(err.message || 'Background cutout failed.', true);
       }
     }
   }
@@ -523,8 +554,8 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Case 4: Cutout not yet loaded -> render dynamic backdrop + subject fallback
-    drawDynamicBackdrop(ctx, w, h, targetHex);
+    // Case 4: Cutout not ready. Keep the original photo visible so we do
+    // not paint a fake color behind the still-opaque original background.
     ctx.drawImage(editorImage, 0, 0, w, h);
 
     if (!cutoutLoading && editSubmissionId.value) {
@@ -547,8 +578,9 @@ document.addEventListener('DOMContentLoaded', () => {
             preview: true
           })
         });
-        const resData = await resp.json();
-        if (resData.success && resData.preview_url && editBgColor.value === targetHex) {
+        let resData = null;
+        try { resData = await resp.json(); } catch (e) { resData = null; }
+        if (resData && resData.success && resData.preview_url && editBgColor.value === targetHex) {
           const aiImg = new Image();
           aiImg.onload = () => {
             colorPreviewCache[targetHex] = aiImg;
@@ -590,6 +622,7 @@ document.addEventListener('DOMContentLoaded', () => {
       cutoutLoading = false;
       colorPreviewCache = {};
       editBgColor.value = '';
+      setEditStatus('');
       swatches.forEach(s => s.classList.toggle('active', s.dataset.color === ''));
 
       // Clear the canvas immediately so previous image is never shown

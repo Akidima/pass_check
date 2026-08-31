@@ -16,7 +16,7 @@ from PIL import Image as PILImage
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from tie_detector import TieDetection
-from verify import check_tie, run_checks, _detect_faces
+from verify import check_tie, run_checks, _detect_faces, reset_perception_health
 
 
 def _make_image(width=500, height=700, color=(200, 200, 200)):
@@ -265,20 +265,25 @@ class TestRequireTieRealWorldImage(unittest.TestCase):
 
     def test_user_uploaded_striped_tie_photo_passes_with_coco_backend(self):
         """The bundled COCO backend detects a real traditional necktie."""
+        env_path = os.environ.get("TIE_REAL_PHOTO_FIXTURE", "").strip()
         candidate_paths = [
-            pathlib.Path("/Users/georgeakidima/.gemini/antigravity-ide/brain/8508fd68-841b-46b0-9288-a4066302f061/.user_uploaded/media_1786962279199.jpg"),
-            pathlib.Path("/Users/georgeakidima/.gemini/antigravity-ide/brain/8508fd68-841b-46b0-9288-a4066302f061/.user_uploaded/media_1786962271625.jpg"),
-            pathlib.Path("/Users/georgeakidima/.gemini/antigravity-ide/brain/841200b8-059b-423c-a86f-52b1962ab545/.user_uploaded/media_1786960848824.jpg"),
+            pathlib.Path(env_path) if env_path else None,
+            pathlib.Path(__file__).resolve().parent / "fixtures" / "patterned_red_tie.png",
         ]
-        test_path = next((p for p in candidate_paths if p.exists()), None)
+        test_path = next((p for p in candidate_paths if p is not None and p.exists()), None)
         if test_path is None:
-            self.skipTest("User uploaded tie test images not found")
+            self.skipTest("Set TIE_REAL_PHOTO_FIXTURE or add tests/fixtures/patterned_red_tie.png")
 
         try:
             import torch  # noqa: F401
             import torchvision  # noqa: F401
         except ImportError:
             self.skipTest("torch and torchvision not available for COCO backend")
+
+        from tie_detector import get_tie_detector
+        get_tie_detector.cache_clear()
+        reset_perception_health()
+        self.addCleanup(reset_perception_health)
 
         image_bytes = test_path.read_bytes()
         bgr = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -302,6 +307,101 @@ class TestRequireTieRealWorldImage(unittest.TestCase):
         self.assertFalse(tie_res["passed"])
         self.assertIn(tie_res["meta"]["decision"], ("reject", "manual_review"))
         self.assertNotEqual(tie_res["meta"]["tie_detected"], True)
+
+    def test_patterned_red_tie_photo_is_not_reported_absent(self):
+        """The failing burgundy-shirt / patterned-red-tie upload must be accepted."""
+        candidates = [
+            pathlib.Path(__file__).resolve().parent / "fixtures" / "patterned_red_tie.png",
+            pathlib.Path(
+                "/Users/georgeakidima/.cursor/projects/"
+                "Users-georgeakidima-Desktop-pass-check/assets/"
+                "Screenshot_2026-08-29_at_19.48.52-9fbdc64e-c36c-4c7f-aac6-30035a6f56ba.png"
+            ),
+        ]
+        test_path = next((path for path in candidates if path.exists()), None)
+        if test_path is None:
+            self.skipTest("Patterned red-tie regression photo not found")
+
+        reset_perception_health()
+        self.addCleanup(reset_perception_health)
+        bgr = cv2.imread(str(test_path))
+        self.assertIsNotNone(bgr)
+        faces = _detect_faces(bgr)
+        self.assertTrue(len(faces) >= 1, "Face must be visible on the regression photo")
+        tie_res = check_tie(bgr, faces, {})
+        self.assertTrue(tie_res["passed"], f"Tie check failed: {tie_res}")
+        self.assertEqual(tie_res["meta"]["tie_status"], "tie_present")
+        self.assertTrue(tie_res["meta"]["tie_detected"])
+
+    @patch("verify.get_tie_detector")
+    def test_structural_recovery_accepts_when_box_model_misses(self, mock_get_detector):
+        """A COCO miss on a structurally obvious patterned tie is not absence."""
+        mock_detector = MagicMock()
+        mock_detector.supports_absence_decision = True
+        mock_detector.detect.return_value = None
+        mock_get_detector.return_value = mock_detector
+
+        bgr = np.full((700, 500, 3), 240, dtype=np.uint8)
+        cv2.ellipse(bgr, (250, 170), (80, 95), 0, 0, 360, (90, 120, 160), -1)
+        bgr[220:700, 90:410] = (45, 20, 85)
+        bgr[250:310, 170:330] = (10, 10, 10)
+        for y in range(270, 640):
+            for x in range(228, 278):
+                bgr[y, x] = (20, 25, 200) if (x + 2 * y) % 8 < 4 else (15, 15, 20)
+        faces = [{"x": 170, "y": 75, "w": 160, "h": 200, "score": 1.0, "keypoints": None}]
+
+        result = check_tie(bgr, faces, {})
+        self.assertTrue(result["passed"], f"Structural recovery failed: {result}")
+        self.assertEqual(result["meta"]["reason"], "structural_cv")
+        self.assertTrue(result["meta"]["tie_detected"])
+
+    @patch("verify.get_tie_detector")
+    def test_upper_knot_only_crop_is_detected(self, mock_get_detector):
+        """A photo cropped through the collar, showing only the knot, must pass.
+
+        Live COCO + MediaPipe GL is host-dependent. This test pins the product
+        rule (knot-only crop is enough) at the visibility/decision layer.
+        """
+        candidates = [
+            pathlib.Path(__file__).resolve().parent / "fixtures" / "patterned_red_tie.png",
+            pathlib.Path(
+                "/Users/georgeakidima/.cursor/projects/"
+                "Users-georgeakidima-Desktop-pass-check/assets/"
+                "Screenshot_2026-08-29_at_19.48.52-9fbdc64e-c36c-4c7f-aac6-30035a6f56ba.png"
+            ),
+        ]
+        test_path = next((path for path in candidates if path.exists()), None)
+        if test_path is None:
+            self.skipTest("Patterned red-tie regression photo not found")
+
+        reset_perception_health()
+        self.addCleanup(reset_perception_health)
+        full = cv2.imread(str(test_path))
+        self.assertIsNotNone(full)
+        faces = _detect_faces(full)
+        self.assertTrue(len(faces) >= 1)
+        face = faces[0]
+        cut = min(full.shape[0], face["y"] + face["h"] + max(36, int(face["h"] * 0.35)))
+        cropped = full[:cut, :].copy()
+        crop_faces = _detect_faces(cropped)
+        self.assertTrue(len(crop_faces) >= 1, "Face must survive the knot-only crop")
+
+        crop_face = crop_faces[0]
+        knot_top = crop_face["y"] + crop_face["h"]
+        knot_box = (
+            crop_face["x"] + int(crop_face["w"] * 0.35),
+            knot_top,
+            crop_face["x"] + int(crop_face["w"] * 0.65),
+            min(cropped.shape[0] - 1, knot_top + max(20, int(crop_face["h"] * 0.25))),
+        )
+        mock_detector = MagicMock()
+        mock_detector.detect.return_value = TieDetection(confidence=0.92, bbox=knot_box)
+        mock_get_detector.return_value = mock_detector
+
+        result = check_tie(cropped, crop_faces, {})
+        self.assertTrue(result["passed"], f"Knot-only crop missed: {result}")
+        self.assertEqual(result["meta"]["tie_status"], "tie_present")
+        self.assertTrue(result["meta"]["tie_detected"])
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ class TieDataset(Dataset):
 
         {
           "images": [
-            {"id": 1, "file_name": "img001.jpg", "width": 640, "height": 480, "student_id": "S001"},
+            {"id": 1, "file_name": "img001.jpg", "width": 640, "height": 480, "identity_id": "application-2026-0001"},
             ...
           ],
           "annotations": [
@@ -41,8 +41,9 @@ class TieDataset(Dataset):
           ]
         }
 
-    The optional ``student_id`` field on each image record is used for
-    identity-disjoint splitting.
+    The ``identity_id`` field is the stable applicant/application reference
+    used for identity-disjoint splitting. It does not need to be a matric
+    number and should not contain a person's name or raw email address.
 
     Parameters
     ----------
@@ -119,11 +120,12 @@ def identity_disjoint_split(
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     seed: int = 42,
+    identity_field: str = "identity_id",
 ) -> dict[str, list[int]]:
-    """Split images into train/val/test by student identity.
+    """Split images into train/val/test by applicant identity.
 
-    If ``student_id`` is not present on image records, falls back to a
-    random image-level split.
+    A stable identity field is mandatory. Image-level fallback is unsafe for
+    model evaluation because the same person's photos can cross splits.
 
     Returns
     -------
@@ -136,12 +138,15 @@ def identity_disjoint_split(
     images = coco["images"]
     rng = random.Random(seed)
 
-    # Group by student_id if available
     by_student: dict[str, list[int]] = defaultdict(list)
-    has_student_id = any("student_id" in img for img in images)
-
     for img in images:
-        key = img.get("student_id", str(img["id"])) if has_student_id else str(img["id"])
+        key = img.get(identity_field)
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(
+                f"Every image must contain a non-empty {identity_field!r}; "
+                "image-level splitting is not allowed for production evaluation."
+            )
+        key = key.strip()
         by_student[key].append(img["id"])
 
     students = list(by_student.keys())
